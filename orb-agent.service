@@ -1,0 +1,15 @@
+[Unit]
+Description=ORB trading alert agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=orb
+EnvironmentFile=/etc/orb-agent.env
+WorkingDirectory=/opt/orb-agent
+ExecStart=/opt/orb-agent/venv/bin/python /opt/orb-agent/orb_agent.py
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target

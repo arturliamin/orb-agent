@@ -17,6 +17,13 @@ SIGNAL RANKING (new in v2) - every qualified breakout gets a 0-100 score:
   Catalyst present .................... 10  (binary; no feed wired in yet -> 0)
   Only the TOP-scoring signal per day is taken, and only if score >= MIN_SCORE.
 
+MA50 BOUNCE (all-day module, ORB has exclusive priority 9:45-10:30):
+  - Candidate: closed above its 50-day SMA within the last 20 sessions, now >= 5% below its
+    20-day high, still above the SMA (declining into it from above)
+  - Touch: intraday low within 0.5% above / 1% below the SMA
+  - Confirmation: a later 1-min bar (10:30-15:00) closes back above the SMA, green, on >= 2x volume
+  - Stop = touch low (capped 2%). Same sizing, scoring (RS measured from the touch), exits.
+
 EXIT:
   - Initial stop = min(structural stop [opposite side of range], 2% loss)
   - Trailing stop arms at +5% gain, exits on a 2-percentage-point giveback from peak
@@ -73,12 +80,17 @@ MAX_TRADES_PER_5_DAYS = 3
 # Ranking weights (sum to 100)
 W_VOLUME, W_STOP, W_RS, W_TREND, W_CATALYST = 30, 25, 20, 15, 10
 VOLUME_CAP_MULT = 5.0      # volume multiple saturates at 5x
-MIN_SCORE = 60.0           # signals below this are not alerted / not traded
+MIN_SCORE = 50.0           # signals below this are not alerted / not traded
 
 TZ = ZoneInfo("America/New_York")
 MARKET_OPEN = dtime(9, 30)
 RANGE_END = dtime(9, 45)
-ENTRY_CUTOFF = dtime(10, 30)
+ENTRY_CUTOFF = dtime(10, 30)       # ORB entries end; bounce scan begins
+BOUNCE_CUTOFF = dtime(15, 0)
+BOUNCE_MIN_DECLINE = 0.05
+BOUNCE_TOUCH_ABOVE = 0.005
+BOUNCE_TOUCH_BELOW = 0.01
+BOUNCE_LOOKBACK_ABOVE = 20
 MARKET_CLOSE = dtime(16, 0)
 EOD_WARN_MINUTES = 10
 
@@ -145,6 +157,89 @@ def etf_symbols():
     except Exception as e:  # noqa: BLE001
         print(f"ETF lookup failed ({e}); using fallback list")
         return ETF_FALLBACK
+
+
+def fetch_daily(symbols) -> pd.DataFrame:
+    """Daily bars back far enough for a 50-day SMA before the first tested day."""
+    from alpaca.data.historical import StockHistoricalDataClient
+    from alpaca.data.requests import StockBarsRequest
+    from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
+    from alpaca.data.enums import DataFeed
+    client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
+    frames = []
+    symbols = sorted(set(symbols))
+    for i in range(0, len(symbols), 100):
+        req = StockBarsRequest(symbol_or_symbols=symbols[i:i + 100], timeframe=TimeFrame(1, TimeFrameUnit.Day),
+                               start=datetime.combine(START_DATE - timedelta(days=120), dtime(0, 0)),
+                               end=datetime.combine(END_DATE, dtime(23, 59)),
+                               feed=DataFeed.IEX if DATA_FEED == "iex" else DataFeed.SIP)
+        df = client.get_stock_bars(req).df
+        if not df.empty:
+            frames.append(df.reset_index())
+    if not frames:
+        return pd.DataFrame()
+    d = pd.concat(frames, ignore_index=True)
+    d["date"] = pd.to_datetime(d["timestamp"]).dt.tz_convert(TZ).dt.date
+    return d
+
+
+def bounce_level_for(daily_sym: pd.DataFrame, date):
+    """Levels as they would have been known at the open of `date` (uses sessions strictly before it)."""
+    g = daily_sym[daily_sym["date"] < date].sort_values("date")
+    if len(g) < 50:
+        return None
+    closes = g["close"].to_numpy()
+    sma50 = closes[-50:].mean()
+    high20 = g["high"].to_numpy()[-20:].max()
+    last = closes[-1]
+    sma_series = pd.Series(closes).rolling(50).mean().to_numpy()[-BOUNCE_LOOKBACK_ABOVE:]
+    was_above = bool(np.nanmax(closes[-BOUNCE_LOOKBACK_ABOVE:] - sma_series) > 0)
+    declining = (high20 - last) / high20 >= BOUNCE_MIN_DECLINE
+    if was_above and declining and last > sma50 * (1 - BOUNCE_TOUCH_BELOW):
+        return {"sma50": float(sma50), "touch_hi": float(sma50 * (1 + BOUNCE_TOUCH_ABOVE)),
+                "touch_lo": float(sma50 * (1 - BOUNCE_TOUCH_BELOW))}
+    return None
+
+
+def find_bounce_for_day(symbol, date, days, lvl, spy_day, trend_rank):
+    """First confirmed MA50 bounce between 10:30 and 15:00, scored."""
+    df = days[date].sort_values("timestamp").reset_index(drop=True)
+    t = df["timestamp"].dt.time
+    touch_mask = (df["low"] <= lvl["touch_hi"]) & (df["low"] >= lvl["touch_lo"])
+    if not touch_mask.any():
+        return None
+    first_touch_idx = int(np.argmax(touch_mask.to_numpy()))
+    touch_time = df.loc[first_touch_idx, "timestamp"]
+    for i in range(first_touch_idx + 1, len(df)):
+        row = df.loc[i]
+        if not (ENTRY_CUTOFF <= t[i] < BOUNCE_CUTOFF):
+            continue
+        if not (row["close"] > lvl["sma50"] and row["close"] > row["open"]):
+            continue
+        base = volume_baseline(days, date, t[i])
+        vol_mult = row["volume"] / base if base and base != float("inf") else 0.0
+        if vol_mult < VOLUME_SPIKE_MULT:
+            continue
+        entry = float(row["close"])
+        touch_low = float(df.loc[:i, "low"][touch_mask.loc[:i]].min())
+        structural_dist = (entry - touch_low) / entry
+        shares, value, stop_dist = size_position(entry, structural_dist)
+        if shares <= 0:
+            return None
+        rel = 0.0
+        if spy_day is not None and not spy_day.empty:
+            sp = spy_day[(spy_day["timestamp"] >= touch_time) & (spy_day["timestamp"] <= row["timestamp"])]
+            if not sp.empty:
+                spy_move = (sp["close"].iloc[-1] - sp["open"].iloc[0]) / sp["open"].iloc[0]
+                rel = (entry - touch_low) / touch_low - spy_move
+        score, parts = score_signal(vol_mult, stop_dist, rel, trend_rank, catalyst=False)
+        return dict(symbol=symbol, date=date, direction="long", setup="MA50_BOUNCE",
+                    entry_time=row["timestamp"], entry_price=entry,
+                    stop_price=entry * (1 - stop_dist), stop_distance_pct=stop_dist,
+                    shares=shares, position_value=value,
+                    vol_mult=round(vol_mult, 2), rel_strength=round(rel * 100, 2),
+                    trend_rank=trend_rank, score=score, **{f"f_{k}": round(v, 2) for k, v in parts.items()})
+    return None
 
 
 def load_trending_log():
@@ -279,7 +374,7 @@ def find_signals_for_day(symbol, date, days, spy_day, trend_rank):
                     rel = -rel
 
         score, parts = score_signal(vol_mult, stop_dist, rel, trend_rank, catalyst=False)
-        return dict(symbol=symbol, date=date, direction=direction,
+        return dict(symbol=symbol, date=date, direction=direction, setup="ORB",
                     entry_time=row["timestamp"], entry_price=entry,
                     stop_price=stop_price, stop_distance_pct=stop_dist,
                     shares=shares, position_value=value,
@@ -342,6 +437,8 @@ def run_backtest():
     if bars.empty:
         print("No data returned.")
         return [], []
+    daily = fetch_daily(universe - {BENCHMARK})
+    daily_by_sym = {sym: g for sym, g in daily.groupby("symbol")} if not daily.empty else {}
     bars["date"] = bars["timestamp"].dt.date
 
     per_symbol = {}
@@ -366,12 +463,29 @@ def run_backtest():
             if sig:
                 day_signals.append(sig)
         all_signals.extend(day_signals)
-        if not day_signals:
-            continue
-        # top score wins; ties -> earliest breakout
+        # ORB has exclusive priority in the first hour
         day_signals.sort(key=lambda s: (-s["score"], s["entry_time"]))
-        best = day_signals[0]
-        if best["score"] < MIN_SCORE:
+        best = day_signals[0] if day_signals and day_signals[0]["score"] >= MIN_SCORE else None
+
+        if best is None:
+            # no ORB entry -> MA50 bounce scan 10:30-15:00
+            bounce_signals = []
+            for sym in candidates:
+                days = per_symbol.get(sym)
+                if not days or date not in days or sym not in daily_by_sym:
+                    continue
+                lvl = bounce_level_for(daily_by_sym[sym], date)
+                if not lvl:
+                    continue
+                rank = trending[date].get(sym) if trending and date in trending else None
+                sig = find_bounce_for_day(sym, date, days, lvl, spy_days.get(date), rank)
+                if sig:
+                    bounce_signals.append(sig)
+            all_signals.extend(bounce_signals)
+            bounce_signals.sort(key=lambda s: (-s["score"], s["entry_time"]))
+            if bounce_signals and bounce_signals[0]["score"] >= MIN_SCORE:
+                best = bounce_signals[0]
+        if best is None:
             continue
         tr = Trade(best)
         manage_trade(tr, add_indicators(per_symbol[best["symbol"]][date]))
@@ -403,7 +517,7 @@ def summarize(trades, signals):
         print("\nNo trades taken in this window.")
         return
     rows = [{
-        "date": t.date, "symbol": t.symbol, "direction": t.direction, "score": t.score,
+        "date": t.date, "symbol": t.symbol, "setup": getattr(t, "setup", "ORB"), "direction": t.direction, "score": t.score,
         "vol_mult": t.vol_mult, "stop_pct": round(t.stop_distance_pct * 100, 2),
         "rel_strength_pct": t.rel_strength, "trend_rank": t.trend_rank,
         "entry_time": t.entry_time, "entry_price": round(t.entry_price, 2),
@@ -425,6 +539,7 @@ def summarize(trades, signals):
     print(f"Total P&L: ${df['pnl_dollars'].sum():.2f} | Avg/trade: ${df['pnl_dollars'].mean():.2f}")
     print(f"Largest win: ${df['pnl_dollars'].max():.2f} | Largest loss: ${df['pnl_dollars'].min():.2f}")
     print(f"Avg score of taken trades: {df['score'].mean():.1f}")
+    print("\nBy setup:\n" + df.groupby("setup")["pnl_dollars"].agg(["count", "sum", "mean"]).round(2).to_string())
     print("\nExit reasons:\n" + df["exit_reason"].value_counts().to_string())
     print("\nWritten: trade_log.csv, signal_log.csv")
 

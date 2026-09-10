@@ -9,6 +9,9 @@ Daily schedule (America/New_York):
   09:45-10:30  Every minute: scan candidates for ORB breakout (EMA9/20, VWAP, 2x volume),
          score each, and alert the single best signal of the day if score >= MIN_SCORE
          and the 3-per-5-business-day cap allows. One entry per day.
+  10:30-15:00  If no ORB entry: scan for MA50 BOUNCE setups (stock declining into its
+         50-day SMA from above, touches it, then a 1-min bar closes back above it on 2x volume).
+         Same scoring, sizing, exits. ORB has exclusive priority in the first hour.
   After entry: monitor every minute for INITIAL_STOP / TRAIL_STOP; alert on hit.
   15:50  EOD_CLOSE alert if the position is still open.
   Then sleep until the next trading day (uses Alpaca's market clock, skips holidays).
@@ -32,7 +35,7 @@ import requests
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.historical.screener import ScreenerClient
 from alpaca.data.requests import StockBarsRequest, StockSnapshotRequest, MostActivesRequest
-from alpaca.data.timeframe import TimeFrame
+from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 from alpaca.data.enums import DataFeed, MostActivesBy
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import GetAssetsRequest
@@ -59,13 +62,18 @@ VOLUME_LOOKBACK_DAYS = 10
 MAX_TRADES_PER_5_DAYS = 3
 W_VOLUME, W_STOP, W_RS, W_TREND, W_CATALYST = 30, 25, 20, 15, 10
 VOLUME_CAP_MULT = 5.0
-MIN_SCORE = 60.0
+MIN_SCORE = 50.0
 
 TZ = ZoneInfo("America/New_York")
 T_SCREEN = dtime(9, 15)
 T_OPEN = dtime(9, 30)
 T_RANGE_END = dtime(9, 45)
-T_ENTRY_CUTOFF = dtime(10, 30)
+T_ENTRY_CUTOFF = dtime(10, 30)     # ORB entries end here; bounce scan starts here
+T_BOUNCE_CUTOFF = dtime(15, 0)     # last bounce entry
+BOUNCE_MIN_DECLINE = 0.05          # >= 5% below its 20-day high
+BOUNCE_TOUCH_ABOVE = 0.005         # low within 0.5% above the SMA counts as a touch...
+BOUNCE_TOUCH_BELOW = 0.01          # ...or pierces it by < 1%
+BOUNCE_LOOKBACK_ABOVE = 20         # must have closed above the SMA within the last 20 sessions
 T_EOD_ALERT = dtime(15, 50)
 T_CLOSE = dtime(16, 0)
 
@@ -295,6 +303,129 @@ def evaluate_symbol(sym, day_bars, rng, baseline, spy_bars, rank):
                 rel=rel, rank=rank, score=score, time=row["timestamp"].isoformat())
 
 
+# ------------------------------------------------------------------ MA50 bounce
+def fetch_daily(symbols, days=90):
+    frames = []
+    symbols = sorted(set(symbols))
+    for i in range(0, len(symbols), 100):
+        req = StockBarsRequest(symbol_or_symbols=symbols[i:i + 100], timeframe=TimeFrame(1, TimeFrameUnit.Day),
+                               start=now() - timedelta(days=days), end=now() - timedelta(days=1), feed=FEED)
+        df = data.get_stock_bars(req).df
+        if not df.empty:
+            frames.append(df.reset_index())
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+
+def bounce_levels(daily):
+    """{symbol: {sma50, touch_lo, touch_hi}} for names declining into their 50-day SMA from above."""
+    out = {}
+    for sym, g in daily.groupby("symbol"):
+        g = g.sort_values("timestamp")
+        if len(g) < 50:
+            continue
+        closes = g["close"].to_numpy()
+        sma50 = closes[-50:].mean()
+        high20 = g["high"].to_numpy()[-20:].max()
+        last = closes[-1]
+        # rolling SMA over the last 20 sessions to test "was above the SMA recently"
+        sma_series = pd.Series(closes).rolling(50).mean().to_numpy()[-BOUNCE_LOOKBACK_ABOVE:]
+        was_above = bool(np.nanmax(closes[-BOUNCE_LOOKBACK_ABOVE:] - sma_series) > 0)
+        declining = (high20 - last) / high20 >= BOUNCE_MIN_DECLINE
+        if was_above and declining and last > sma50 * (1 - BOUNCE_TOUCH_BELOW):
+            out[sym] = {"sma50": float(sma50),
+                        "touch_hi": float(sma50 * (1 + BOUNCE_TOUCH_ABOVE)),
+                        "touch_lo": float(sma50 * (1 - BOUNCE_TOUCH_BELOW))}
+    return out
+
+
+def evaluate_bounce(sym, day_bars, lvl, baseline, spy_bars, rank):
+    """Touch of the 50-SMA earlier today, and the LATEST bar closes back above it on volume."""
+    if day_bars.empty or len(day_bars) < 5:
+        return None
+    df = day_bars.sort_values("timestamp")
+    touched = df[(df["low"] <= lvl["touch_hi"]) & (df["low"] >= lvl["touch_lo"])]
+    if touched.empty:
+        return None
+    row = df.iloc[-1]
+    if touched.index[-1] == row.name and len(touched) == 1:
+        return None  # the touch bar itself is not a confirmation
+    if not (row["close"] > lvl["sma50"] and row["close"] > row["open"]):
+        return None
+    base = baseline.get(sym, {}).get(row["timestamp"].time())
+    if not base:
+        return None
+    vol_mult = row["volume"] / base
+    if vol_mult < VOLUME_SPIKE_MULT:
+        return None
+    entry = float(row["close"])
+    touch_low = float(touched["low"].min())
+    structural_dist = (entry - touch_low) / entry
+    shares, value, stop_dist = size_position(entry, structural_dist)
+    if shares <= 0:
+        return None
+    stop_price = entry * (1 - stop_dist)
+    # relative strength measured from the touch bar: how hard it bounced vs SPY over the same minutes
+    rel = 0.0
+    touch_time = touched["timestamp"].iloc[0]
+    if not spy_bars.empty:
+        sp = spy_bars.sort_values("timestamp")
+        sp_since = sp[sp["timestamp"] >= touch_time]
+        if not sp_since.empty:
+            spy_move = (sp_since["close"].iloc[-1] - sp_since["open"].iloc[0]) / sp_since["open"].iloc[0]
+            rel = (entry - touch_low) / touch_low - spy_move
+    score = score_signal(vol_mult, stop_dist, rel, rank)
+    return dict(symbol=sym, direction="long", setup="MA50_BOUNCE", entry_price=entry, stop_price=stop_price,
+                stop_dist=stop_dist, shares=shares, value=value, vol_mult=vol_mult, rel=rel, rank=rank,
+                score=score, time=row["timestamp"].isoformat(), sma50=lvl["sma50"])
+
+
+def announce_entry(best, slots):
+    side = "BUY" if best["direction"] == "long" else "SELL SHORT"
+    tag = best.get("setup", "ORB")
+    push(f"{side} {best['symbol']} — {tag} score {best['score']}",
+         f"Entry ~{best['entry_price']:.2f} | stop {best['stop_price']:.2f} ({best['stop_dist']*100:.1f}%)\n"
+         f"{best['shares']} sh ≈ ${best['value']:,.0f}\n"
+         f"vol {best['vol_mult']:.1f}x · RS {best['rel']*100:+.1f}% · rank #{best['rank']}"
+         + (f" · SMA50 {best['sma50']:.2f}" if "sma50" in best else "") +
+         f"\nTrail arms at +5%, 2pt giveback. Slots left after this: {slots-1}", 2)
+
+
+def monitor_position(position, today):
+    eod = datetime.combine(today, T_EOD_ALERT, tzinfo=TZ)
+    is_long = position["direction"] == "long"
+    ep = position["entry_price"]
+    while now() < eod:
+        next_tick = (now() + timedelta(minutes=1)).replace(second=15, microsecond=0)
+        try:
+            b = fetch_bars([position["symbol"]], datetime.fromisoformat(position["time"]), now())
+            b = b[b["timestamp"] > datetime.fromisoformat(position["time"])]
+            for _, row in b.iterrows():
+                best = row["high"] if is_long else row["low"]
+                worst = row["low"] if is_long else row["high"]
+                best_gain = (best - ep) / ep if is_long else (ep - best) / ep
+                worst_gain = (worst - ep) / ep if is_long else (ep - worst) / ep
+                position["peak"] = max(position["peak"], best_gain)
+                if position["peak"] >= TRAIL_ARM_PCT and not position["armed"]:
+                    position["armed"] = True
+                    push(f"{position['symbol']} trailing armed",
+                         f"Up {position['peak']*100:.1f}%. Exit if it gives back 2 pts from peak.", 0)
+                if not position["armed"] and ((worst <= position["stop_price"]) if is_long else (worst >= position["stop_price"])):
+                    push(f"STOP HIT — exit {position['symbol']}",
+                         f"Stop {position['stop_price']:.2f} touched. Close the position now.", 2)
+                    return
+                if position["armed"]:
+                    gb = position["peak"] - TRAIL_GIVEBACK_PCT
+                    if worst_gain <= gb:
+                        lvl = ep * (1 + gb) if is_long else ep * (1 - gb)
+                        push(f"TRAIL HIT — exit {position['symbol']}",
+                             f"Gave back 2 pts from +{position['peak']*100:.1f}% peak (~{lvl:.2f}). Close now.", 2)
+                        return
+        except Exception as e:  # noqa: BLE001
+            log(f"monitor error: {e}")
+        sleep_until(next_tick)
+    push(f"EOD — close {position['symbol']}", "10 minutes to close and no exit has triggered. Close the position.", 2)
+
+
 # ------------------------------------------------------------------ daily loop
 def run_trading_day(today: date):
     log(f"=== Trading day {today} ===")
@@ -317,8 +448,14 @@ def run_trading_day(today: date):
     hist = fetch_bars(symbols, datetime.combine(today - timedelta(days=16), dtime(0, 0), tzinfo=TZ),
                       datetime.combine(today, dtime(0, 0), tzinfo=TZ))
     baseline = build_volume_baseline(hist)
+    try:
+        levels = bounce_levels(fetch_daily(symbols))
+    except Exception as e:  # noqa: BLE001
+        log(f"daily bars failed ({e}); bounce scan disabled today")
+        levels = {}
+    log(f"MA50 bounce watchlist: {len(levels)} names: {sorted(levels)[:10]}")
     push("ORB agent ready", f"{len(symbols)} candidates, {slots} trade slot(s) left this week.\n"
-         f"Top: {', '.join(symbols[:8])}", 0 if slots else 1)
+         f"Top: {', '.join(symbols[:8])}\nMA50-bounce watch: {len(levels)}", 0 if slots else 1)
     if slots <= 0:
         log("No trade slots this week; will still send RANGE_SET then sleep.")
 
@@ -360,55 +497,44 @@ def run_trading_day(today: date):
                     trades.append({"date": today.isoformat(), "symbol": best["symbol"],
                                    "direction": best["direction"], "entry": best["entry_price"]})
                     save_trades(trades)
-                    side = "BUY" if best["direction"] == "long" else "SELL SHORT"
-                    push(f"{side} {best['symbol']} — score {best['score']}",
-                         f"Entry ~{best['entry_price']:.2f} | stop {best['stop_price']:.2f} ({best['stop_dist']*100:.1f}%)\n"
-                         f"{best['shares']} sh ≈ ${best['value']:,.0f}\n"
-                         f"vol {best['vol_mult']:.1f}x · RS {best['rel']*100:+.1f}% · rank #{best['rank']}\n"
-                         f"Trail arms at +5%, 2pt giveback. Slots left after this: {slots-1}", 2)
+                    announce_entry(best, slots)
         except Exception as e:  # noqa: BLE001
             log(f"scan error: {e}\n{traceback.format_exc()}")
         sleep_until(next_tick)
 
+    if position is None and levels:
+        push("ORB window closed", f"No ORB entry. Scanning {len(levels)} names for MA50 bounces until 3:00.", -1)
+        cutoff = datetime.combine(today, T_BOUNCE_CUTOFF, tzinfo=TZ)
+        watch = [s for s in levels]
+        while now() < cutoff and position is None:
+            next_tick = (now() + timedelta(minutes=1)).replace(second=15, microsecond=0)
+            try:
+                bars = regular_hours(fetch_bars(watch + ["SPY"], day_start, now()))
+                spy = bars[bars["symbol"] == "SPY"]
+                signals = []
+                for sym, g in bars.groupby("symbol"):
+                    if sym in levels:
+                        sig = evaluate_bounce(sym, g, levels[sym], baseline, spy, rank_of.get(sym))
+                        if sig:
+                            signals.append(sig)
+                if signals:
+                    signals.sort(key=lambda s: -s["score"])
+                    best = signals[0]
+                    log(f"{len(signals)} bounce signal(s); best {best['symbol']} {best['score']}")
+                    if best["score"] >= MIN_SCORE:
+                        position = dict(best, date=today.isoformat(), peak=0.0, armed=False)
+                        trades.append({"date": today.isoformat(), "symbol": best["symbol"], "setup": "MA50_BOUNCE",
+                                       "direction": "long", "entry": best["entry_price"]})
+                        save_trades(trades)
+                        announce_entry(best, slots)
+            except Exception as e:  # noqa: BLE001
+                log(f"bounce scan error: {e}\n{traceback.format_exc()}")
+            sleep_until(next_tick)
+
     if position is None:
-        push("No entry today", "Scan window closed 10:30 with no qualifying signal.", -1)
+        push("No entry today", "No qualifying ORB or MA50-bounce signal.", -1)
         return
-
-    # monitor to close
-    eod = datetime.combine(today, T_EOD_ALERT, tzinfo=TZ)
-    is_long = position["direction"] == "long"
-    ep = position["entry_price"]
-    while now() < eod:
-        next_tick = (now() + timedelta(minutes=1)).replace(second=15, microsecond=0)
-        try:
-            b = fetch_bars([position["symbol"]], datetime.fromisoformat(position["time"]), now())
-            b = b[b["timestamp"] > datetime.fromisoformat(position["time"])]
-            for _, row in b.iterrows():
-                best = row["high"] if is_long else row["low"]
-                worst = row["low"] if is_long else row["high"]
-                best_gain = (best - ep) / ep if is_long else (ep - best) / ep
-                worst_gain = (worst - ep) / ep if is_long else (ep - worst) / ep
-                position["peak"] = max(position["peak"], best_gain)
-                if position["peak"] >= TRAIL_ARM_PCT and not position["armed"]:
-                    position["armed"] = True
-                    push(f"{position['symbol']} trailing armed",
-                         f"Up {position['peak']*100:.1f}%. Exit if it gives back 2 pts from peak.", 0)
-                if not position["armed"] and ((worst <= position["stop_price"]) if is_long else (worst >= position["stop_price"])):
-                    push(f"STOP HIT — exit {position['symbol']}",
-                         f"Stop {position['stop_price']:.2f} touched. Close the position now.", 2)
-                    return
-                if position["armed"]:
-                    gb = position["peak"] - TRAIL_GIVEBACK_PCT
-                    if worst_gain <= gb:
-                        lvl = ep * (1 + gb) if is_long else ep * (1 - gb)
-                        push(f"TRAIL HIT — exit {position['symbol']}",
-                             f"Gave back 2 pts from +{position['peak']*100:.1f}% peak (~{lvl:.2f}). Close now.", 2)
-                        return
-        except Exception as e:  # noqa: BLE001
-            log(f"monitor error: {e}")
-        sleep_until(next_tick)
-
-    push(f"EOD — close {position['symbol']}", "10 minutes to close and no exit has triggered. Close the position.", 2)
+    monitor_position(position, today)
 
 
 def main():

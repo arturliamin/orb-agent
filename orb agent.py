@@ -24,12 +24,20 @@ today's open get the +10 catalyst score points and a "Reported: beat/miss, gap" 
 Names reporting tonight / tomorrow pre-market are dropped from the MA50-bounce watch (a bounce
 into an earnings gap is a coin flip). Set FINNHUB_API_KEY to enable; without it the layer is off.
 
+EXECUTION (Robinhood Agentic account via MCP, see rh_mcp.py):
+  EXECUTE=true in the env file turns it on; default off (alerts only).
+  When on: equity = agentic buying power at 9:15; LONG signals -> review -> limit buy at
+  ask+0.3% -> wait for fill -> stop_market sell at the stop -> push with real fill.
+  Trail/EOD exits: cancel the resting stop, market sell. Shorts stay alert-only
+  (limited-margin account can't short). Position state is persisted so a restart resumes.
+
 Environment variables (put them in /etc/orb-agent.env):
-  ALPACA_API_KEY, ALPACA_SECRET_KEY, PUSHOVER_TOKEN, PUSHOVER_USER, FINNHUB_API_KEY (optional)
+  ALPACA_API_KEY, ALPACA_SECRET_KEY, PUSHOVER_TOKEN, PUSHOVER_USER, FINNHUB_API_KEY (optional),
+  EXECUTE (true/false, default false)
 Optional: ACCOUNT_EQUITY (default 10000), STATE_DIR (default /var/lib/orb-agent)
 """
 
-import os, sys, json, csv, time, math, traceback, re
+import os, sys, json, csv, time, math, traceback, re, uuid
 from datetime import datetime, timedelta, time as dtime, date
 from zoneinfo import ZoneInfo
 
@@ -53,6 +61,9 @@ PO_TOKEN = os.environ["PUSHOVER_TOKEN"]
 PO_USER = os.environ["PUSHOVER_USER"]
 ACCOUNT_EQUITY = float(os.environ.get("ACCOUNT_EQUITY", "10000"))
 FINNHUB_KEY = os.environ.get("FINNHUB_API_KEY", "").strip()
+EXECUTE = os.environ.get("EXECUTE", "false").strip().lower() == "true"
+ENTRY_LIMIT_PAD = 0.003        # marketable limit: 0.3% above last for buys
+FILL_WAIT_SECONDS = 90         # cancel the entry if not filled by then
 STATE_DIR = os.environ.get("STATE_DIR", "/var/lib/orb-agent")
 FEED = DataFeed.IEX
 
@@ -85,6 +96,7 @@ T_CLOSE = dtime(16, 0)
 
 os.makedirs(STATE_DIR, exist_ok=True)
 TRADES_FILE = os.path.join(STATE_DIR, "trades.json")
+POSITION_FILE = os.path.join(STATE_DIR, "position.json")
 LOG_CSV = os.path.join(STATE_DIR, "trending_log.csv")
 
 data = StockHistoricalDataClient(API_KEY, SECRET_KEY)
@@ -448,13 +460,35 @@ def announce_entry(best, slots, cat_text=""):
          f"\nTrail arms at +5%, 2pt giveback. Slots left after this: {slots-1}", 2)
 
 
+def _live_exit(position, reason):
+    """Market-out a live position and report; returns True when done."""
+    try:
+        oid = rh_exit_market(position["symbol"], position["shares"], position.get("stop_order_id"))
+        if oid == "STOP_ALREADY_FILLED":
+            push(f"STOP FILLED — {position['symbol']}", "Robinhood stop order executed. Position closed.", 1)
+        else:
+            push(f"{reason} — SOLD {position['symbol']}", f"Market sell placed for {position['shares']} sh (order {str(oid)[:8]}).", 1)
+    except Exception as e:  # noqa: BLE001
+        push(f"{reason} — SELL FAILED {position['symbol']}", f"Close it manually NOW.\n{str(e)[:200]}", 2)
+    clear_position()
+    return True
+
+
 def monitor_position(position, today):
     eod = datetime.combine(today, T_EOD_ALERT, tzinfo=TZ)
     is_long = position["direction"] == "long"
     ep = position["entry_price"]
+    live = position.get("live", False)
     while now() < eod:
         next_tick = (now() + timedelta(minutes=1)).replace(second=15, microsecond=0)
         try:
+            if live and position.get("stop_order_id"):
+                so = rh_order(position["stop_order_id"]) or {}
+                if so.get("state") == "filled":
+                    push(f"STOP FILLED — {position['symbol']}",
+                         f"Sold {so.get('cumulative_quantity')} @ {so.get('average_price')}. Position closed.", 1)
+                    clear_position()
+                    return
             b = fetch_bars([position["symbol"]], datetime.fromisoformat(position["time"]), now())
             b = b[b["timestamp"] > datetime.fromisoformat(position["time"])]
             for _, row in b.iterrows():
@@ -468,28 +502,195 @@ def monitor_position(position, today):
                     push(f"{position['symbol']} trailing armed",
                          f"Up {position['peak']*100:.1f}%. Exit if it gives back 2 pts from peak.", 0)
                 if not position["armed"] and ((worst <= position["stop_price"]) if is_long else (worst >= position["stop_price"])):
+                    if live:
+                        continue  # the resting stop order handles it; confirmed via order state above
                     push(f"STOP HIT — exit {position['symbol']}",
                          f"Stop {position['stop_price']:.2f} touched. Close the position now.", 2)
+                    clear_position()
                     return
                 if position["armed"]:
                     gb = position["peak"] - TRAIL_GIVEBACK_PCT
                     if worst_gain <= gb:
                         lvl = ep * (1 + gb) if is_long else ep * (1 - gb)
+                        if live:
+                            _live_exit(position, "TRAIL HIT")
+                            return
                         push(f"TRAIL HIT — exit {position['symbol']}",
                              f"Gave back 2 pts from +{position['peak']*100:.1f}% peak (~{lvl:.2f}). Close now.", 2)
+                        clear_position()
                         return
+            save_position(position)
         except Exception as e:  # noqa: BLE001
             log(f"monitor error: {e}")
         sleep_until(next_tick)
+    if live:
+        _live_exit(position, "EOD CLOSE")
+        return
     push(f"EOD — close {position['symbol']}", "10 minutes to close and no exit has triggered. Close the position.", 2)
+    clear_position()
+
+
+# ------------------------------------------------------------------ execution (Robinhood MCP)
+_rh = None
+_rh_account = None
+BLOCKER_WORDS = ("insufficient", "buying power", "pattern day", "halted", "not tradable", "restricted", "rejected")
+
+
+def rh():
+    global _rh
+    if _rh is None:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from rh_mcp import RH
+        _rh = RH()
+    return _rh
+
+
+def rh_data(res):
+    return res.get("data", res) if isinstance(res, dict) else res
+
+
+def rh_account():
+    """Agentic account number (cached)."""
+    global _rh_account
+    if _rh_account:
+        return _rh_account
+    for a in rh_data(rh().call("get_accounts")).get("accounts", []):
+        if a.get("agentic_allowed"):
+            _rh_account = a["account_number"]
+            return _rh_account
+    raise RuntimeError("no agentic-enabled Robinhood account visible to this client")
+
+
+def rh_buying_power():
+    p = rh_data(rh().call("get_portfolio", account_number=rh_account()))
+    bp = p.get("buying_power", {})
+    return float(bp.get("unleveraged_buying_power") or bp.get("buying_power") or 0)
+
+
+def rh_order(order_id):
+    o = rh_data(rh().call("get_equity_orders", account_number=rh_account(), order_id=order_id)).get("orders", [])
+    return o[0] if o else None
+
+
+def _blocking(review):
+    txt = json.dumps(review).lower()
+    hits = [w for w in BLOCKER_WORDS if w in txt]
+    return hits
+
+
+def rh_enter_long(symbol, shares, ref_price, stop_dist):
+    """Review -> limit buy -> wait for fill -> resting stop. Returns dict or raises."""
+    acct = rh_account()
+    limit = f"{ref_price * (1 + ENTRY_LIMIT_PAD):.2f}"
+    review = rh().call("review_equity_order", account_number=acct, side="buy", symbol=symbol,
+                       type="limit", quantity=str(shares), limit_price=limit, time_in_force="gfd")
+    log(f"review {symbol} x{shares} @{limit}: {json.dumps(rh_data(review))[:400]}")
+    hits = _blocking(review)
+    if hits:
+        raise RuntimeError(f"review flagged {hits}: {json.dumps(rh_data(review))[:300]}")
+    ref = str(uuid.uuid4())
+    placed = rh_data(rh().call("place_equity_order", account_number=acct, side="buy", symbol=symbol,
+                               type="limit", quantity=str(shares), limit_price=limit,
+                               time_in_force="gfd", ref_id=ref))
+    order_id = placed.get("id") or (placed.get("order") or {}).get("id")
+    log(f"entry placed {symbol} id={order_id}")
+    deadline = time.time() + FILL_WAIT_SECONDS
+    filled_qty, avg = 0.0, None
+    while time.time() < deadline:
+        time.sleep(5)
+        o = rh_order(order_id) or {}
+        filled_qty = float(o.get("cumulative_quantity") or 0)
+        avg = float(o.get("average_price")) if o.get("average_price") else None
+        if o.get("state") in ("filled",) or (filled_qty >= shares):
+            break
+        if o.get("state") in ("cancelled", "rejected", "failed", "voided"):
+            raise RuntimeError(f"entry {o.get('state')}: {json.dumps(o)[:300]}")
+    if filled_qty <= 0:
+        try:
+            rh().call("cancel_equity_order", account_number=acct, order_id=order_id)
+        except Exception as e:  # noqa: BLE001
+            log(f"cancel after no-fill failed: {e}")
+        raise RuntimeError(f"entry not filled within {FILL_WAIT_SECONDS}s; cancelled")
+    if filled_qty < shares:
+        try:
+            rh().call("cancel_equity_order", account_number=acct, order_id=order_id)
+        except Exception:  # noqa: BLE001
+            pass
+    qty = int(filled_qty)  # whole shares only, stop orders can't be fractional
+    stop_price = (avg or ref_price) * (1 - stop_dist)   # stop distance re-anchored on the real fill
+    stop = rh_data(rh().call("place_equity_order", account_number=acct, side="sell", symbol=symbol,
+                             type="stop_market", quantity=str(qty), stop_price=f"{stop_price:.2f}",
+                             time_in_force="gfd", ref_id=str(uuid.uuid4())))
+    stop_id = stop.get("id") or (stop.get("order") or {}).get("id")
+    log(f"stop placed {symbol} x{qty} @{stop_price:.2f} id={stop_id}")
+    return {"entry_order_id": order_id, "stop_order_id": stop_id, "filled_qty": qty,
+            "avg_price": avg or ref_price, "stop_price": round(stop_price, 2)}
+
+
+def rh_exit_market(symbol, qty, stop_order_id):
+    """Cancel the resting stop (if still open) and sell at market."""
+    acct = rh_account()
+    if stop_order_id:
+        st = (rh_order(stop_order_id) or {}).get("state")
+        if st in ("filled",):
+            return "STOP_ALREADY_FILLED"
+        try:
+            rh().call("cancel_equity_order", account_number=acct, order_id=stop_order_id)
+        except Exception as e:  # noqa: BLE001
+            log(f"cancel stop failed ({e}); selling anyway")
+    sold = rh_data(rh().call("place_equity_order", account_number=acct, side="sell", symbol=symbol,
+                             type="market", quantity=str(qty), time_in_force="gfd", ref_id=str(uuid.uuid4())))
+    return sold.get("id") or (sold.get("order") or {}).get("id")
+
+
+def execute_or_alert(best, slots, cat_text, today):
+    """Announce the signal; if EXECUTE and long, place the trade and return an enriched position."""
+    position = dict(best, date=today.isoformat(), peak=0.0, armed=False, live=False)
+    if EXECUTE and best["direction"] == "long" and ACCOUNT_EQUITY > 0:
+        try:
+            fill = rh_enter_long(best["symbol"], best["shares"], best["entry_price"], best["stop_dist"])
+            position.update(live=True, entry_price=fill["avg_price"], shares=fill["filled_qty"],
+                            value=fill["avg_price"] * fill["filled_qty"], **fill)
+            cat_text = (cat_text + "\n" if cat_text else "") + \
+                f"EXECUTED: {fill['filled_qty']} sh filled @ {fill['avg_price']:.2f}, stop resting @ {position['stop_price']:.2f}"
+        except Exception as e:  # noqa: BLE001
+            log(f"execution failed: {e}\n{traceback.format_exc()}")
+            cat_text = (cat_text + "\n" if cat_text else "") + f"EXECUTION FAILED — trade manually if you want it: {str(e)[:160]}"
+    elif EXECUTE and best["direction"] == "short":
+        cat_text = (cat_text + "\n" if cat_text else "") + "Short signal: not auto-executed (limited-margin account)."
+    announce_entry(best, slots, cat_text)
+    save_position(position)
+    return position
+
+
+def save_position(pos):
+    json.dump(pos, open(POSITION_FILE, "w"), indent=1, default=str)
+
+
+def clear_position():
+    if os.path.exists(POSITION_FILE):
+        os.remove(POSITION_FILE)
 
 
 # ------------------------------------------------------------------ daily loop
 def run_trading_day(today: date):
     log(f"=== Trading day {today} ===")
+    clear_position()
+    global ACCOUNT_EQUITY
     trades = load_trades()
     used = len(trades_in_window(trades, today))
     slots = MAX_TRADES_PER_5_DAYS - used
+    if EXECUTE:
+        try:
+            bp = rh_buying_power()
+            if bp > 0:
+                ACCOUNT_EQUITY = bp
+            log(f"EXECUTE on: agentic account ••••{rh_account()[-4:]}, buying power ${bp:,.2f}")
+            if bp <= 0:
+                push("Execution paused", "Agentic buying power is $0 — alerts only today.", 1)
+        except Exception as e:  # noqa: BLE001
+            log(f"Robinhood check failed: {e}")
+            push("Execution unavailable", f"Robinhood client error — alerts only today.\n{str(e)[:200]}", 1)
 
     # 09:15 screener
     sleep_until(datetime.combine(today, T_SCREEN, tzinfo=TZ))
@@ -565,13 +766,13 @@ def run_trading_day(today: date):
                 best = signals[0]
                 log(f"{len(signals)} signal(s); best {best['symbol']} {best['score']}")
                 if best["score"] >= MIN_SCORE:
-                    position = dict(best, date=today.isoformat(), peak=0.0, armed=False)
                     trades.append({"date": today.isoformat(), "symbol": best["symbol"],
                                    "direction": best["direction"], "entry": best["entry_price"]})
                     save_trades(trades)
                     g0 = bars[bars["symbol"] == best["symbol"]].sort_values("timestamp")
-                    announce_entry(best, slots, catalyst_line(best["symbol"], reported,
-                                   prev_close.get(best["symbol"]), float(g0["open"].iloc[0]) if not g0.empty else None))
+                    ct = catalyst_line(best["symbol"], reported, prev_close.get(best["symbol"]),
+                                       float(g0["open"].iloc[0]) if not g0.empty else None)
+                    position = execute_or_alert(best, slots, ct, today)
         except Exception as e:  # noqa: BLE001
             log(f"scan error: {e}\n{traceback.format_exc()}")
         sleep_until(next_tick)
@@ -622,7 +823,19 @@ def main():
             today = now().date()
             market_today = clock.is_open or next_open.date() == today
             if market_today and now().time() < T_EOD_ALERT:
-                run_trading_day(today)
+                resumed = None
+                if os.path.exists(POSITION_FILE):
+                    try:
+                        resumed = json.load(open(POSITION_FILE))
+                    except Exception:  # noqa: BLE001
+                        resumed = None
+                if resumed and resumed.get("date") == today.isoformat():
+                    log(f"Resuming open position {resumed['symbol']} after restart")
+                    push("Agent restarted", f"Resuming monitoring of {resumed['symbol']}.", -1)
+                    monitor_position(resumed, today)
+                else:
+                    clear_position()
+                    run_trading_day(today)
             # sleep to 09:00 of the next trading day
             target_day = next_open.date() if next_open.date() > today or not market_today else today + timedelta(days=1)
             wake = datetime.combine(target_day, dtime(9, 0), tzinfo=TZ)

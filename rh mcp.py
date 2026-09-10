@@ -80,9 +80,10 @@ async def _redirect_handler(url: str) -> None:
 
 async def _callback_handler() -> AuthorizationCodeResult:
     pasted = await asyncio.get_event_loop().run_in_executor(None, input, "Paste redirected URL: ")
-    q = parse_qs(urlparse(pasted.strip()).query)
-    code = (q.get("code") or [None])[0]
-    state = (q.get("state") or [None])[0]
+    cleaned = pasted.strip().strip("'\"<>` ")
+    q = parse_qs(urlparse(cleaned).query)
+    code = ((q.get("code") or [None])[0] or "").strip("'\" ")
+    state = ((q.get("state") or [None])[0] or "").strip("'\" ") or None
     if not code:
         raise SystemExit("No ?code= found in what you pasted. Try the login again.")
     return AuthorizationCodeResult(code=code, state=state)

@@ -2,7 +2,7 @@
 ORB Live Alert Agent  (notify-only; you place the trades)
 =========================================================
 Daily schedule (America/New_York):
-  09:15  Pull Alpaca most-actives, keep top 100 priced >= $5, log to trending_log.csv,
+  09:15  Pull Alpaca most-actives, drop ETFs/ETNs/funds, keep top 100 priced >= $5, log to trending_log.csv,
          pull 10-day 1-min history for those names (volume baseline) + SPY.
   09:30  Start collecting 1-min bars.
   09:45  Opening range locked. Alert RANGE_SET summary.
@@ -21,7 +21,7 @@ Environment variables (put them in /etc/orb-agent.env):
 Optional: ACCOUNT_EQUITY (default 10000), STATE_DIR (default /var/lib/orb-agent)
 """
 
-import os, sys, json, csv, time, math, traceback
+import os, sys, json, csv, time, math, traceback, re
 from datetime import datetime, timedelta, time as dtime, date
 from zoneinfo import ZoneInfo
 
@@ -35,6 +35,8 @@ from alpaca.data.requests import StockBarsRequest, StockSnapshotRequest, MostAct
 from alpaca.data.timeframe import TimeFrame
 from alpaca.data.enums import DataFeed, MostActivesBy
 from alpaca.trading.client import TradingClient
+from alpaca.trading.requests import GetAssetsRequest
+from alpaca.trading.enums import AssetStatus, AssetClass
 
 # ------------------------------------------------------------------ config
 API_KEY = os.environ["ALPACA_API_KEY"]
@@ -57,7 +59,7 @@ VOLUME_LOOKBACK_DAYS = 10
 MAX_TRADES_PER_5_DAYS = 3
 W_VOLUME, W_STOP, W_RS, W_TREND, W_CATALYST = 30, 25, 20, 15, 10
 VOLUME_CAP_MULT = 5.0
-MIN_SCORE = 40.0
+MIN_SCORE = 60.0
 
 TZ = ZoneInfo("America/New_York")
 T_SCREEN = dtime(9, 15)
@@ -74,6 +76,32 @@ LOG_CSV = os.path.join(STATE_DIR, "trending_log.csv")
 data = StockHistoricalDataClient(API_KEY, SECRET_KEY)
 screener = ScreenerClient(API_KEY, SECRET_KEY)
 trading = TradingClient(API_KEY, SECRET_KEY, paper=True)
+
+ETF_NAME_RE = re.compile(r"\b(ETF|ETN|Trust|Fund|Index|Shares|iShares|ProShares|SPDR|Invesco|Direxion|"
+                         r"Vanguard|VanEck|WisdomTree|Schwab|Global X|Ultra|Bull|Bear|2x|3x)\b", re.I)
+ETF_EXCHANGES = {"ARCA", "BATS"}
+_etf_cache = {"date": None, "symbols": set()}
+
+
+def etf_symbols():
+    """Set of symbols that look like ETFs/ETNs/funds. Refreshed once per day."""
+    if _etf_cache["date"] == now().date():
+        return _etf_cache["symbols"]
+    out = set()
+    try:
+        assets = trading.get_all_assets(GetAssetsRequest(status=AssetStatus.ACTIVE, asset_class=AssetClass.US_EQUITY))
+        for a in assets:
+            ex = str(a.exchange.value if hasattr(a.exchange, "value") else a.exchange)
+            if ex in ETF_EXCHANGES or ETF_NAME_RE.search(a.name or ""):
+                out.add(a.symbol)
+        log(f"ETF filter: {len(out)} symbols excluded")
+    except Exception as e:  # noqa: BLE001
+        log(f"ETF lookup failed ({e}); using fallback list")
+        out = {"SPY","QQQ","IWM","DIA","TQQQ","SQQQ","SOXL","SOXS","SPXL","SPXS","UVXY","VXX","XLF","XLE","XLK",
+               "ARKK","GLD","SLV","TLT","HYG","LQD","EEM","EFA","VTI","VOO","IVV","XLV","XLI","XLY","XLP","XBI",
+               "SMH","KRE","GDX","USO","UNG","TNA","TZA","LABU","LABD","NVDL","TSLL","MSTU","MSTZ","BITO","IBIT"}
+    _etf_cache.update(date=now().date(), symbols=out)
+    return out
 
 
 # ------------------------------------------------------------------ helpers
@@ -143,9 +171,12 @@ def fetch_screener():
                         break
             if px:
                 prices[s] = float(px)
+    etfs = etf_symbols()
     ranked = []
     for a in actives:
         px = prices.get(a.symbol)
+        if a.symbol in etfs:
+            continue
         if px and px >= MIN_PRICE:
             ranked.append((a.symbol, px, a.volume))
         if len(ranked) >= TOP_N:

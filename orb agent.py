@@ -19,8 +19,13 @@ Daily schedule (America/New_York):
 Assumption: when a BUY/SELL signal is sent, the agent tracks a hypothetical position
 from the alert price so it can send exit alerts. If you skip a trade, ignore its exits.
 
+Earnings catalyst (Finnhub, free tier): names that reported after yesterday's close or before
+today's open get the +10 catalyst score points and a "Reported: beat/miss, gap" line in the alert.
+Names reporting tonight / tomorrow pre-market are dropped from the MA50-bounce watch (a bounce
+into an earnings gap is a coin flip). Set FINNHUB_API_KEY to enable; without it the layer is off.
+
 Environment variables (put them in /etc/orb-agent.env):
-  ALPACA_API_KEY, ALPACA_SECRET_KEY, PUSHOVER_TOKEN, PUSHOVER_USER
+  ALPACA_API_KEY, ALPACA_SECRET_KEY, PUSHOVER_TOKEN, PUSHOVER_USER, FINNHUB_API_KEY (optional)
 Optional: ACCOUNT_EQUITY (default 10000), STATE_DIR (default /var/lib/orb-agent)
 """
 
@@ -47,13 +52,14 @@ SECRET_KEY = os.environ["ALPACA_SECRET_KEY"]
 PO_TOKEN = os.environ["PUSHOVER_TOKEN"]
 PO_USER = os.environ["PUSHOVER_USER"]
 ACCOUNT_EQUITY = float(os.environ.get("ACCOUNT_EQUITY", "10000"))
+FINNHUB_KEY = os.environ.get("FINNHUB_API_KEY", "").strip()
 STATE_DIR = os.environ.get("STATE_DIR", "/var/lib/orb-agent")
 FEED = DataFeed.IEX
 
 MIN_PRICE = 5.0
 TOP_N = 100
 RISK_PER_TRADE = 50.0
-MAX_POSITION_PCT = 0.30
+MAX_POSITION_PCT = float(os.environ.get("MAX_POSITION_PCT", "1.0"))   # 1.0 = one position may use the whole account
 STOP_CAP_PCT = 0.02
 TRAIL_ARM_PCT = 0.05
 TRAIL_GIVEBACK_PCT = 0.02
@@ -261,7 +267,7 @@ def score_signal(vol_mult, stop_dist, rel, rank, catalyst=False):
     return round(W_VOLUME * f_vol + W_STOP * f_stop + W_RS * f_rs + W_TREND * f_trend + W_CATALYST * f_cat, 1)
 
 
-def evaluate_symbol(sym, day_bars, rng, baseline, spy_bars, rank):
+def evaluate_symbol(sym, day_bars, rng, baseline, spy_bars, rank, catalyst=False):
     """Check the LATEST bar for a fresh breakout. Returns a signal dict or None."""
     if day_bars.empty or len(day_bars) < 20:
         return None
@@ -297,10 +303,61 @@ def evaluate_symbol(sym, day_bars, rng, baseline, spy_bars, rank):
         rel = stock_move - spy_move
         if direction == "short":
             rel = -rel
-    score = score_signal(vol_mult, stop_dist, rel, rank)
-    return dict(symbol=sym, direction=direction, entry_price=entry, stop_price=stop_price,
+    score = score_signal(vol_mult, stop_dist, rel, rank, catalyst)
+    return dict(symbol=sym, direction=direction, setup="ORB", entry_price=entry, stop_price=stop_price,
                 stop_dist=stop_dist, shares=shares, value=value, vol_mult=vol_mult,
-                rel=rel, rank=rank, score=score, time=row["timestamp"].isoformat())
+                rel=rel, rank=rank, score=score, catalyst=catalyst, time=row["timestamp"].isoformat())
+
+
+# ------------------------------------------------------------------ earnings catalyst
+def fetch_earnings(today: date):
+    """Returns (reported, upcoming). reported = {sym: {eps_actual, eps_est, hour, date}} for names that
+    reported after the prior session's close or before today's open. upcoming = set reporting tonight or
+    tomorrow pre-market."""
+    if not FINNHUB_KEY:
+        return {}, set()
+    prev = today - timedelta(days=1)
+    while prev.weekday() >= 5:
+        prev -= timedelta(days=1)
+    nxt = today + timedelta(days=1)
+    while nxt.weekday() >= 5:
+        nxt += timedelta(days=1)
+    try:
+        r = requests.get("https://finnhub.io/api/v1/calendar/earnings",
+                         params={"from": prev.isoformat(), "to": nxt.isoformat(), "token": FINNHUB_KEY}, timeout=15)
+        r.raise_for_status()
+        rows = r.json().get("earningsCalendar", [])
+    except Exception as e:  # noqa: BLE001
+        log(f"earnings calendar failed: {e}")
+        return {}, set()
+    reported, upcoming = {}, set()
+    for e in rows:
+        sym, d, hour = e.get("symbol"), e.get("date"), (e.get("hour") or "").lower()
+        if not sym or not d:
+            continue
+        if (d == prev.isoformat() and hour in ("amc", "dmh", "")) or (d == today.isoformat() and hour == "bmo"):
+            reported[sym] = {"eps_actual": e.get("epsActual"), "eps_est": e.get("epsEstimate"), "hour": hour, "date": d}
+        elif (d == today.isoformat() and hour in ("amc", "dmh", "")) or (d == nxt.isoformat() and hour == "bmo"):
+            upcoming.add(sym)
+    return reported, upcoming
+
+
+def catalyst_line(sym, reported, prev_close=None, today_open=None):
+    e = reported.get(sym)
+    if not e:
+        return ""
+    a, est = e.get("eps_actual"), e.get("eps_est")
+    if a is not None and est not in (None, 0):
+        surprise = (a - est) / abs(est) * 100
+        verdict = "BEAT" if a > est else ("MISS" if a < est else "INLINE")
+        txt = f"Reported: EPS {a:.2f} vs {est:.2f} est ({verdict} {surprise:+.0f}%)"
+    elif a is not None:
+        txt = f"Reported: EPS {a:.2f}"
+    else:
+        txt = "Reported (EPS pending)"
+    if prev_close and today_open:
+        txt += f", gap {(today_open - prev_close) / prev_close * 100:+.1f}%"
+    return txt
 
 
 # ------------------------------------------------------------------ MA50 bounce
@@ -338,7 +395,7 @@ def bounce_levels(daily):
     return out
 
 
-def evaluate_bounce(sym, day_bars, lvl, baseline, spy_bars, rank):
+def evaluate_bounce(sym, day_bars, lvl, baseline, spy_bars, rank, catalyst=False):
     """Touch of the 50-SMA earlier today, and the LATEST bar closes back above it on volume."""
     if day_bars.empty or len(day_bars) < 5:
         return None
@@ -373,20 +430,21 @@ def evaluate_bounce(sym, day_bars, lvl, baseline, spy_bars, rank):
         if not sp_since.empty:
             spy_move = (sp_since["close"].iloc[-1] - sp_since["open"].iloc[0]) / sp_since["open"].iloc[0]
             rel = (entry - touch_low) / touch_low - spy_move
-    score = score_signal(vol_mult, stop_dist, rel, rank)
+    score = score_signal(vol_mult, stop_dist, rel, rank, catalyst)
     return dict(symbol=sym, direction="long", setup="MA50_BOUNCE", entry_price=entry, stop_price=stop_price,
                 stop_dist=stop_dist, shares=shares, value=value, vol_mult=vol_mult, rel=rel, rank=rank,
-                score=score, time=row["timestamp"].isoformat(), sma50=lvl["sma50"])
+                score=score, catalyst=catalyst, time=row["timestamp"].isoformat(), sma50=lvl["sma50"])
 
 
-def announce_entry(best, slots):
+def announce_entry(best, slots, cat_text=""):
     side = "BUY" if best["direction"] == "long" else "SELL SHORT"
-    tag = best.get("setup", "ORB")
+    tag = best.get("setup", "ORB") + (" +catalyst" if best.get("catalyst") else "")
     push(f"{side} {best['symbol']} — {tag} score {best['score']}",
          f"Entry ~{best['entry_price']:.2f} | stop {best['stop_price']:.2f} ({best['stop_dist']*100:.1f}%)\n"
          f"{best['shares']} sh ≈ ${best['value']:,.0f}\n"
          f"vol {best['vol_mult']:.1f}x · RS {best['rel']*100:+.1f}% · rank #{best['rank']}"
-         + (f" · SMA50 {best['sma50']:.2f}" if "sma50" in best else "") +
+         + (f" · SMA50 {best['sma50']:.2f}" if "sma50" in best else "")
+         + (f"\n{cat_text}" if cat_text else "") +
          f"\nTrail arms at +5%, 2pt giveback. Slots left after this: {slots-1}", 2)
 
 
@@ -453,9 +511,23 @@ def run_trading_day(today: date):
     except Exception as e:  # noqa: BLE001
         log(f"daily bars failed ({e}); bounce scan disabled today")
         levels = {}
+    reported, upcoming = fetch_earnings(today)
+    reported = {k: v for k, v in reported.items() if k in rank_of}
+    dropped = [s for s in levels if s in upcoming]
+    for s_ in dropped:
+        levels.pop(s_, None)
+    prev_close = {}
+    try:
+        for sym, g in fetch_daily(symbols, days=10).groupby("symbol"):
+            prev_close[sym] = float(g.sort_values("timestamp")["close"].iloc[-1])
+    except Exception:  # noqa: BLE001
+        pass
+    log(f"Earnings: {len(reported)} candidates reported ({sorted(reported)[:8]}); "
+        f"{len(dropped)} dropped from bounce watch for reporting tonight")
     log(f"MA50 bounce watchlist: {len(levels)} names: {sorted(levels)[:10]}")
     push("ORB agent ready", f"{len(symbols)} candidates, {slots} trade slot(s) left this week.\n"
-         f"Top: {', '.join(symbols[:8])}\nMA50-bounce watch: {len(levels)}", 0 if slots else 1)
+         f"Top: {', '.join(symbols[:8])}\nMA50-bounce watch: {len(levels)}"
+         + (f"\nEarnings catalysts: {', '.join(sorted(reported)[:8])}" if reported else "\nEarnings feed: off"), 0 if slots else 1)
     if slots <= 0:
         log("No trade slots this week; will still send RANGE_SET then sleep.")
 
@@ -485,7 +557,7 @@ def run_trading_day(today: date):
             for sym, g in bars.groupby("symbol"):
                 if sym == "SPY" or sym not in ranges:
                     continue
-                sig = evaluate_symbol(sym, g, ranges[sym], baseline, spy, rank_of.get(sym))
+                sig = evaluate_symbol(sym, g, ranges[sym], baseline, spy, rank_of.get(sym), sym in reported)
                 if sig:
                     signals.append(sig)
             if signals:
@@ -497,7 +569,9 @@ def run_trading_day(today: date):
                     trades.append({"date": today.isoformat(), "symbol": best["symbol"],
                                    "direction": best["direction"], "entry": best["entry_price"]})
                     save_trades(trades)
-                    announce_entry(best, slots)
+                    g0 = bars[bars["symbol"] == best["symbol"]].sort_values("timestamp")
+                    announce_entry(best, slots, catalyst_line(best["symbol"], reported,
+                                   prev_close.get(best["symbol"]), float(g0["open"].iloc[0]) if not g0.empty else None))
         except Exception as e:  # noqa: BLE001
             log(f"scan error: {e}\n{traceback.format_exc()}")
         sleep_until(next_tick)
@@ -514,7 +588,7 @@ def run_trading_day(today: date):
                 signals = []
                 for sym, g in bars.groupby("symbol"):
                     if sym in levels:
-                        sig = evaluate_bounce(sym, g, levels[sym], baseline, spy, rank_of.get(sym))
+                        sig = evaluate_bounce(sym, g, levels[sym], baseline, spy, rank_of.get(sym), sym in reported)
                         if sig:
                             signals.append(sig)
                 if signals:
@@ -526,7 +600,9 @@ def run_trading_day(today: date):
                         trades.append({"date": today.isoformat(), "symbol": best["symbol"], "setup": "MA50_BOUNCE",
                                        "direction": "long", "entry": best["entry_price"]})
                         save_trades(trades)
-                        announce_entry(best, slots)
+                        g0 = bars[bars["symbol"] == best["symbol"]].sort_values("timestamp")
+                    announce_entry(best, slots, catalyst_line(best["symbol"], reported,
+                                   prev_close.get(best["symbol"]), float(g0["open"].iloc[0]) if not g0.empty else None))
             except Exception as e:  # noqa: BLE001
                 log(f"bounce scan error: {e}\n{traceback.format_exc()}")
             sleep_until(next_tick)

@@ -7,7 +7,8 @@ id -u orb &>/dev/null || useradd -r -m -s /usr/sbin/nologin orb
 mkdir -p /opt/orb-agent /var/lib/orb-agent
 cp orb_agent.py /opt/orb-agent/
 python3 -m venv /opt/orb-agent/venv
-/opt/orb-agent/venv/bin/pip install -q alpaca-py pandas numpy requests
+/opt/orb-agent/venv/bin/pip install -q alpaca-py pandas numpy requests mcp
+cp rh_mcp.py /opt/orb-agent/ 2>/dev/null || true
 chown -R orb:orb /opt/orb-agent /var/lib/orb-agent
 cp orb-agent.service /etc/systemd/system/
 if [ ! -f /etc/orb-agent.env ]; then

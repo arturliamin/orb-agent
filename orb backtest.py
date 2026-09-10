@@ -54,6 +54,7 @@ from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
+import requests
 
 # ---------------------------------------------------------------------------
 # CONFIG
@@ -61,6 +62,7 @@ import pandas as pd
 
 ALPACA_API_KEY = os.environ.get("ALPACA_API_KEY", "YOUR_KEY_ID_HERE")
 ALPACA_SECRET_KEY = os.environ.get("ALPACA_SECRET_KEY", "YOUR_SECRET_KEY_HERE")
+FINNHUB_KEY = os.environ.get("FINNHUB_API_KEY", "").strip()   # optional: enables the earnings catalyst layer
 DATA_FEED = "iex"  # "iex" = free tier, "sip" = paid consolidated tape
 
 TRENDING_LOG = os.environ.get("TRENDING_LOG_PATH", "trending_log.csv")
@@ -68,9 +70,9 @@ WATCHLIST = ["AAPL", "TSLA", "NVDA", "AMD", "SPY"]   # fallback only
 BENCHMARK = "SPY"
 OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "/mnt/user-data/outputs")
 
-ACCOUNT_EQUITY = 10_000.0
+ACCOUNT_EQUITY = float(os.environ.get("ACCOUNT_EQUITY", "1000"))
 RISK_PER_TRADE = 50.0
-MAX_POSITION_PCT = 0.30
+MAX_POSITION_PCT = float(os.environ.get("MAX_POSITION_PCT", "1.0"))
 STOP_CAP_PCT = 0.02
 TRAIL_ARM_PCT = 0.05
 TRAIL_GIVEBACK_PCT = 0.02
@@ -201,7 +203,7 @@ def bounce_level_for(daily_sym: pd.DataFrame, date):
     return None
 
 
-def find_bounce_for_day(symbol, date, days, lvl, spy_day, trend_rank):
+def find_bounce_for_day(symbol, date, days, lvl, spy_day, trend_rank, catalyst=False):
     """First confirmed MA50 bounce between 10:30 and 15:00, scored."""
     df = days[date].sort_values("timestamp").reset_index(drop=True)
     t = df["timestamp"].dt.time
@@ -232,14 +234,44 @@ def find_bounce_for_day(symbol, date, days, lvl, spy_day, trend_rank):
             if not sp.empty:
                 spy_move = (sp["close"].iloc[-1] - sp["open"].iloc[0]) / sp["open"].iloc[0]
                 rel = (entry - touch_low) / touch_low - spy_move
-        score, parts = score_signal(vol_mult, stop_dist, rel, trend_rank, catalyst=False)
-        return dict(symbol=symbol, date=date, direction="long", setup="MA50_BOUNCE",
+        score, parts = score_signal(vol_mult, stop_dist, rel, trend_rank, catalyst=catalyst)
+        return dict(symbol=symbol, date=date, direction="long", setup="MA50_BOUNCE", catalyst=catalyst,
                     entry_time=row["timestamp"], entry_price=entry,
                     stop_price=entry * (1 - stop_dist), stop_distance_pct=stop_dist,
                     shares=shares, position_value=value,
                     vol_mult=round(vol_mult, 2), rel_strength=round(rel * 100, 2),
                     trend_rank=trend_rank, score=score, **{f"f_{k}": round(v, 2) for k, v in parts.items()})
     return None
+
+
+def load_earnings_catalysts(dates):
+    """{date: set(symbols)} that reported after the prior session's close or before that day's open."""
+    if not FINNHUB_KEY or not dates:
+        return {}
+    try:
+        r = requests.get("https://finnhub.io/api/v1/calendar/earnings",
+                         params={"from": (min(dates) - timedelta(days=4)).isoformat(),
+                                 "to": max(dates).isoformat(), "token": FINNHUB_KEY}, timeout=20)
+        r.raise_for_status()
+        rows = r.json().get("earningsCalendar", [])
+    except Exception as e:  # noqa: BLE001
+        print(f"earnings calendar failed ({e}); catalyst layer off")
+        return {}
+    sorted_dates = sorted(dates)
+    out = {d: set() for d in sorted_dates}
+    for e in rows:
+        sym, d, hour = e.get("symbol"), e.get("date"), (e.get("hour") or "").lower()
+        if not sym or not d:
+            continue
+        rd = datetime.fromisoformat(d).date()
+        if hour == "bmo":
+            if rd in out:
+                out[rd].add(sym)
+        else:  # amc / unknown -> catalyst for the NEXT session
+            later = [x for x in sorted_dates if x > rd]
+            if later:
+                out[later[0]].add(sym)
+    return out
 
 
 def load_trending_log():
@@ -327,7 +359,7 @@ def size_position(entry_price, structural_dist_pct):
     return shares, shares * entry_price, stop_dist
 
 
-def find_signals_for_day(symbol, date, days, spy_day, trend_rank):
+def find_signals_for_day(symbol, date, days, spy_day, trend_rank, catalyst=False):
     """Return the FIRST qualified breakout for this symbol on this date, scored."""
     day_df = add_indicators(days[date])
     t = day_df["timestamp"].dt.time
@@ -373,8 +405,8 @@ def find_signals_for_day(symbol, date, days, spy_day, trend_rank):
                 if direction == "short":
                     rel = -rel
 
-        score, parts = score_signal(vol_mult, stop_dist, rel, trend_rank, catalyst=False)
-        return dict(symbol=symbol, date=date, direction=direction, setup="ORB",
+        score, parts = score_signal(vol_mult, stop_dist, rel, trend_rank, catalyst=catalyst)
+        return dict(symbol=symbol, date=date, direction=direction, setup="ORB", catalyst=catalyst,
                     entry_time=row["timestamp"], entry_price=entry,
                     stop_price=stop_price, stop_distance_pct=stop_dist,
                     shares=shares, position_value=value,
@@ -450,8 +482,13 @@ def run_backtest():
     all_dates = sorted({d for s in per_symbol.values() for d in s})
     test_dates = all_dates[-TEST_TRADING_DAYS:]
 
+    catalysts = load_earnings_catalysts(test_dates)
+    if catalysts:
+        print(f"Earnings catalysts loaded for {sum(1 for v in catalysts.values() if v)} days")
+
     all_signals, chosen = [], []
     for date in test_dates:
+        cats = catalysts.get(date, set())
         candidates = (set(trending[date]) if trending and date in trending else universe) - etfs - {BENCHMARK}
         day_signals = []
         for sym in candidates:
@@ -459,7 +496,7 @@ def run_backtest():
             if not days or date not in days:
                 continue
             rank = trending[date].get(sym) if trending and date in trending else None
-            sig = find_signals_for_day(sym, date, days, spy_days.get(date), rank)
+            sig = find_signals_for_day(sym, date, days, spy_days.get(date), rank, sym in cats)
             if sig:
                 day_signals.append(sig)
         all_signals.extend(day_signals)
@@ -478,7 +515,7 @@ def run_backtest():
                 if not lvl:
                     continue
                 rank = trending[date].get(sym) if trending and date in trending else None
-                sig = find_bounce_for_day(sym, date, days, lvl, spy_days.get(date), rank)
+                sig = find_bounce_for_day(sym, date, days, lvl, spy_days.get(date), rank, sym in cats)
                 if sig:
                     bounce_signals.append(sig)
             all_signals.extend(bounce_signals)
@@ -517,7 +554,8 @@ def summarize(trades, signals):
         print("\nNo trades taken in this window.")
         return
     rows = [{
-        "date": t.date, "symbol": t.symbol, "setup": getattr(t, "setup", "ORB"), "direction": t.direction, "score": t.score,
+        "date": t.date, "symbol": t.symbol, "setup": getattr(t, "setup", "ORB"), "catalyst": getattr(t, "catalyst", False),
+        "direction": t.direction, "score": t.score,
         "vol_mult": t.vol_mult, "stop_pct": round(t.stop_distance_pct * 100, 2),
         "rel_strength_pct": t.rel_strength, "trend_rank": t.trend_rank,
         "entry_time": t.entry_time, "entry_price": round(t.entry_price, 2),

@@ -62,6 +62,7 @@ PO_USER = os.environ["PUSHOVER_USER"]
 ACCOUNT_EQUITY = float(os.environ.get("ACCOUNT_EQUITY", "10000"))
 FINNHUB_KEY = os.environ.get("FINNHUB_API_KEY", "").strip()
 EXECUTE = os.environ.get("EXECUTE", "false").strip().lower() == "true"
+_execution_ok = False          # set at 9:15 once the broker check passes
 ENTRY_LIMIT_PAD = 0.003        # marketable limit: 0.3% above last for buys
 FILL_WAIT_SECONDS = 90         # cancel the entry if not filled by then
 STATE_DIR = os.environ.get("STATE_DIR", "/var/lib/orb-agent")
@@ -545,6 +546,21 @@ def rh():
     return _rh
 
 
+def rh_login_expired():
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from rh_mcp import LoginExpired
+    return LoginExpired
+
+
+def rh_days_left():
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from rh_mcp import RH
+        return RH.days_left()
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def rh_data(res):
     return res.get("data", res) if isinstance(res, dict) else res
 
@@ -646,17 +662,20 @@ def rh_exit_market(symbol, qty, stop_order_id):
 def execute_or_alert(best, slots, cat_text, today):
     """Announce the signal; if EXECUTE and long, place the trade and return an enriched position."""
     position = dict(best, date=today.isoformat(), peak=0.0, armed=False, live=False)
-    if EXECUTE and best["direction"] == "long" and ACCOUNT_EQUITY > 0:
+    if EXECUTE and _execution_ok and best["direction"] == "long" and ACCOUNT_EQUITY > 0:
         try:
             fill = rh_enter_long(best["symbol"], best["shares"], best["entry_price"], best["stop_dist"])
             position.update(live=True, entry_price=fill["avg_price"], shares=fill["filled_qty"],
                             value=fill["avg_price"] * fill["filled_qty"], **fill)
             cat_text = (cat_text + "\n" if cat_text else "") + \
                 f"EXECUTED: {fill['filled_qty']} sh filled @ {fill['avg_price']:.2f}, stop resting @ {position['stop_price']:.2f}"
+        except rh_login_expired() as e:
+            log(f"execution blocked, login expired: {e}")
+            cat_text = (cat_text + "\n" if cat_text else "") + "NOT EXECUTED — Robinhood login expired. Trade manually if you want it."
         except Exception as e:  # noqa: BLE001
             log(f"execution failed: {e}\n{traceback.format_exc()}")
             cat_text = (cat_text + "\n" if cat_text else "") + f"EXECUTION FAILED — trade manually if you want it: {str(e)[:160]}"
-    elif EXECUTE and best["direction"] == "short":
+    elif EXECUTE and _execution_ok and best["direction"] == "short":
         cat_text = (cat_text + "\n" if cat_text else "") + "Short signal: not auto-executed (limited-margin account)."
     announce_entry(best, slots, cat_text)
     save_position(position)
@@ -681,16 +700,40 @@ def run_trading_day(today: date):
     used = len(trades_in_window(trades, today))
     slots = MAX_TRADES_PER_5_DAYS - used
     if EXECUTE:
-        try:
-            bp = rh_buying_power()
-            if bp > 0:
-                ACCOUNT_EQUITY = bp
-            log(f"EXECUTE on: agentic account ••••{rh_account()[-4:]}, buying power ${bp:,.2f}")
-            if bp <= 0:
-                push("Execution paused", "Agentic buying power is $0 — alerts only today.", 1)
-        except Exception as e:  # noqa: BLE001
-            log(f"Robinhood check failed: {e}")
-            push("Execution unavailable", f"Robinhood client error — alerts only today.\n{str(e)[:200]}", 1)
+        global _execution_ok
+        _execution_ok = False
+        days = rh_days_left()
+        if days is not None and days < 2:
+            push("Robinhood login expiring",
+                 f"About {days:.1f} day(s) left. Re-authorize soon:\n"
+                 f"rh_mcp.py login\nExecution stops when it lapses.", 1)
+        last_err = None
+        for attempt in (1, 2):
+            try:
+                bp = rh_buying_power()
+                if bp > 0:
+                    ACCOUNT_EQUITY = bp
+                _execution_ok = True
+                log(f"EXECUTE on: agentic account ••••{rh_account()[-4:]}, buying power ${bp:,.2f}"
+                    + (f", login {days:.1f}d left" if days is not None else ""))
+                if bp <= 0:
+                    _execution_ok = False
+                    push("Execution paused", "Agentic buying power is $0 — alerts only today.", 1)
+                break
+            except rh_login_expired() as e:
+                log(f"Robinhood login expired: {e}")
+                push("Robinhood login expired",
+                     "Execution is OFF until you re-authorize:\n"
+                     "sudo -u orb /opt/orb-agent/venv/bin/python /opt/orb-agent/rh_mcp.py login\n"
+                     "then: systemctl restart orb-agent", 2)
+                break
+            except Exception as e:  # noqa: BLE001
+                last_err = e
+                log(f"Robinhood check failed (attempt {attempt}): {e}")
+                if attempt == 1:
+                    time.sleep(20)
+        else:
+            push("Execution unavailable", f"Robinhood error — alerts only today.\n{str(last_err)[:200]}", 1)
 
     # 09:15 screener
     sleep_until(datetime.combine(today, T_SCREEN, tzinfo=TZ))

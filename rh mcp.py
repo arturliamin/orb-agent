@@ -10,6 +10,12 @@ One-time login (run as the service user so the token file is readable by the age
 Read-only probe (proves auth + lists accounts, buying power, a quote):
     sudo -u orb /opt/orb-agent/venv/bin/python /opt/orb-agent/rh_mcp.py probe
 
+Force a token refresh without a browser (a weekly cron can keep the login alive):
+    sudo -u orb /opt/orb-agent/venv/bin/python /opt/orb-agent/rh_mcp.py refresh
+
+Check how long the current login has left (exit code 1 if it expires within 2 days):
+    sudo -u orb /opt/orb-agent/venv/bin/python /opt/orb-agent/rh_mcp.py status
+
 Library use from orb_agent.py:
     from rh_mcp import RH
     rh = RH()                          # loads saved tokens; refreshes automatically
@@ -21,8 +27,10 @@ Tokens live in $STATE_DIR/rh_tokens.json (default /var/lib/orb-agent). Nothing e
 
 import asyncio
 import json
+import logging
 import os
 import sys
+import time
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
@@ -37,6 +45,40 @@ MCP_URL = os.environ.get("RH_MCP_URL", "https://agent.robinhood.com/mcp/trading"
 STATE_DIR = Path(os.environ.get("STATE_DIR", "/var/lib/orb-agent"))
 TOKEN_FILE = STATE_DIR / "rh_tokens.json"
 REDIRECT_URI = "http://localhost:8765/callback"
+INTERACTIVE = False          # set True only by the `login` CLI command
+WARN_WITHIN_DAYS = 2
+
+_sdk_msgs: list[str] = []
+
+
+class _Capture(logging.Handler):
+    """Keeps SDK auth warnings so a failure can report why, not just that."""
+
+    def emit(self, record):
+        _sdk_msgs.append(record.getMessage())
+
+
+logging.getLogger("mcp.client.auth").addHandler(_Capture())
+logging.getLogger("mcp.client.auth").setLevel(logging.WARNING)
+
+
+class LoginExpired(RuntimeError):
+    """Raised when the saved login can no longer be refreshed and a browser is required."""
+
+
+def unwrap(exc: BaseException) -> str:
+    """Flatten ExceptionGroup/TaskGroup wrappers into the underlying cause(s)."""
+    out = []
+    stack = [exc]
+    while stack:
+        e = stack.pop()
+        subs = getattr(e, "exceptions", None)
+        if subs:
+            stack.extend(subs)
+            continue
+        out.append(f"{type(e).__name__}: {e}")
+    hints = [m for m in _sdk_msgs if "refresh" in m.lower() or "token" in m.lower()]
+    return " | ".join(out[:3] + hints[-2:])
 
 
 class FileTokenStorage(TokenStorage):
@@ -59,7 +101,17 @@ class FileTokenStorage(TokenStorage):
     async def set_tokens(self, tokens: OAuthToken) -> None:
         d = self._load()
         d["tokens"] = tokens.model_dump(exclude_none=True)
+        d["obtained_at"] = time.time()
         self._save(d)
+
+    def expiry_info(self) -> tuple[float | None, float | None]:
+        """(seconds_remaining, days_remaining) for the saved access token, or (None, None)."""
+        d = self._load()
+        t, got = d.get("tokens"), d.get("obtained_at")
+        if not t or not got or not t.get("expires_in"):
+            return None, None
+        left = got + float(t["expires_in"]) - time.time()
+        return left, left / 86400
 
     async def get_client_info(self) -> OAuthClientInformationFull | None:
         d = self._load().get("client")
@@ -72,6 +124,9 @@ class FileTokenStorage(TokenStorage):
 
 
 async def _redirect_handler(url: str) -> None:
+    if not INTERACTIVE:
+        raise LoginExpired(
+            "Robinhood login expired and could not be refreshed; re-authorize with: rh_mcp.py login")
     print("\n=== OPEN THIS URL ON YOUR DESKTOP BROWSER ===\n")
     print(url)
     print("\nSign in and approve. The browser will land on a localhost page that fails to load.")
@@ -79,6 +134,9 @@ async def _redirect_handler(url: str) -> None:
 
 
 async def _callback_handler() -> AuthorizationCodeResult:
+    if not INTERACTIVE:
+        raise LoginExpired(
+            "Robinhood login expired and could not be refreshed; re-authorize with: rh_mcp.py login")
     pasted = await asyncio.get_event_loop().run_in_executor(None, input, "Paste redirected URL: ")
     cleaned = pasted.strip().strip("'\"<>` ")
     q = parse_qs(urlparse(cleaned).query)
@@ -126,7 +184,20 @@ def _unwrap(result):
 
 
 class RH:
-    """Synchronous wrapper used by the agent."""
+    """Synchronous wrapper used by the agent. Raises LoginExpired when a browser is needed."""
+
+    @staticmethod
+    def _run(fn):
+        _sdk_msgs.clear()
+        try:
+            return asyncio.run(_with_session(fn))
+        except LoginExpired:
+            raise
+        except BaseException as e:  # noqa: BLE001
+            flat = unwrap(e)
+            if "LoginExpired" in flat or "No ?code=" in flat:
+                raise LoginExpired(flat) from None
+            raise RuntimeError(flat) from None
 
     def call(self, tool: str, **args):
         async def go(session):
@@ -134,16 +205,22 @@ class RH:
             if getattr(res, "isError", False):
                 raise RuntimeError(f"{tool}: {_unwrap(res)}")
             return _unwrap(res)
-        return asyncio.run(_with_session(go))
+        return self._run(go)
 
     def tools(self):
         async def go(session):
             return [t.name for t in (await session.list_tools()).tools]
-        return asyncio.run(_with_session(go))
+        return self._run(go)
+
+    @staticmethod
+    def days_left() -> float | None:
+        return FileTokenStorage().expiry_info()[1]
 
 
 # ---------------------------------------------------------------- CLI
 def _cmd_login():
+    global INTERACTIVE
+    INTERACTIVE = True
     rh = RH()
     names = rh.tools()
     print(f"\nLogged in. {len(names)} tools available. Tokens saved to {TOKEN_FILE}")
@@ -169,6 +246,30 @@ def _cmd_probe():
     print("\nProbe OK.")
 
 
+def _cmd_refresh():
+    """Force a headless renewal by making a trivial call; the SDK refreshes if needed."""
+    before = FileTokenStorage().expiry_info()[1]
+    try:
+        n = len(RH().tools())
+    except LoginExpired as e:
+        print(f"REFRESH FAILED — browser login required.\n{e}")
+        raise SystemExit(1)
+    after = FileTokenStorage().expiry_info()[1]
+    print(f"OK ({n} tools). Days left: {before:.1f} -> {after:.1f}" if before and after else f"OK ({n} tools).")
+    if before and after and after <= before + 0.01:
+        print("NOTE: expiry did not move — the token was still valid, so no refresh was attempted.")
+
+
+def _cmd_status():
+    left, days = FileTokenStorage().expiry_info()
+    if days is None:
+        print("No saved token. Run: rh_mcp.py login")
+        raise SystemExit(1)
+    print(f"Robinhood login: {days:.1f} days left ({left/3600:.0f}h)")
+    raise SystemExit(1 if days < WARN_WITHIN_DAYS else 0)
+
+
 if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else "probe"
-    {"login": _cmd_login, "probe": _cmd_probe}.get(cmd, _cmd_probe)()
+    {"login": _cmd_login, "probe": _cmd_probe,
+     "refresh": _cmd_refresh, "status": _cmd_status}.get(cmd, _cmd_probe)()

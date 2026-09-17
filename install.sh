@@ -25,3 +25,10 @@ else
 systemctl daemon-reload && systemctl enable --now orb-agent && systemctl restart orb-agent
 echo ">>> Agent running. Logs: journalctl -u orb-agent -f"
 fi
+
+# --- keep the Robinhood login alive: refresh twice a week, well inside the ~7.8 day token life
+cat > /etc/cron.d/orb-agent-refresh <<'CRON'
+17 7 * * 1,4 orb STATE_DIR=/var/lib/orb-agent /opt/orb-agent/venv/bin/python /opt/orb-agent/rh_mcp.py refresh >> /var/log/orb-refresh.log 2>&1
+CRON
+chmod 644 /etc/cron.d/orb-agent-refresh
+echo ">>> Weekly token refresh installed (Mon/Thu 07:17)."

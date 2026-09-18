@@ -62,6 +62,9 @@ PO_USER = os.environ["PUSHOVER_USER"]
 ACCOUNT_EQUITY = float(os.environ.get("ACCOUNT_EQUITY", "10000"))
 FINNHUB_KEY = os.environ.get("FINNHUB_API_KEY", "").strip()
 EXECUTE = os.environ.get("EXECUTE", "false").strip().lower() == "true"
+# The agentic account is limited-margin and cannot short. Shorts are logged and alerted
+# as informational only: they never take the day's entry or consume a trade slot.
+SHORTS_TRADABLE = os.environ.get("SHORTS_TRADABLE", "false").strip().lower() == "true"
 _execution_ok = False          # set at 9:15 once the broker check passes
 ENTRY_LIMIT_PAD = 0.003        # marketable limit: 0.3% above last for buys
 FILL_WAIT_SECONDS = 90         # cancel the entry if not filled by then
@@ -132,6 +135,11 @@ def etf_symbols():
 
 
 # ------------------------------------------------------------------ helpers
+class _NoTradableSignal(Exception):
+    """Every signal this minute was untradable (e.g. shorts on a limited-margin account).
+    Raised so the scan continues to the next minute without taking an entry or a slot."""
+
+
 def now():
     return datetime.now(TZ)
 
@@ -789,6 +797,7 @@ def run_trading_day(today: date):
         return
 
     # 09:45-10:30 scan loop, one signal per day
+    shorts_alerted = set()
     position = None
     cutoff = datetime.combine(today, T_ENTRY_CUTOFF, tzinfo=TZ)
     while now() < cutoff and position is None:
@@ -806,8 +815,19 @@ def run_trading_day(today: date):
                     signals.append(sig)
             if signals:
                 signals.sort(key=lambda s: -s["score"])
+                if not SHORTS_TRADABLE:
+                    shorts = [x for x in signals if x["direction"] == "short"]
+                    for sh in shorts:
+                        if sh["symbol"] not in shorts_alerted and sh["score"] >= MIN_SCORE:
+                            shorts_alerted.add(sh["symbol"])
+                            push(f"Short setup (not traded) — {sh['symbol']} score {sh['score']}",
+                                 f"Breakdown below {sh['entry_price']:.2f}, stop {sh['stop_price']:.2f}.\n"
+                                 f"Account can't short; no slot used. Trade manually if you want it.", 0)
+                    signals = [x for x in signals if x["direction"] == "long"]
+                if not signals:
+                    raise _NoTradableSignal
                 best = signals[0]
-                log(f"{len(signals)} signal(s); best {best['symbol']} {best['score']}")
+                log(f"{len(signals)} tradable signal(s); best {best['symbol']} {best['score']}")
                 if best["score"] >= MIN_SCORE:
                     trades.append({"date": today.isoformat(), "symbol": best["symbol"],
                                    "direction": best["direction"], "entry": best["entry_price"]})
@@ -816,6 +836,8 @@ def run_trading_day(today: date):
                     ct = catalyst_line(best["symbol"], reported, prev_close.get(best["symbol"]),
                                        float(g0["open"].iloc[0]) if not g0.empty else None)
                     position = execute_or_alert(best, slots, ct, today)
+        except _NoTradableSignal:
+            pass
         except Exception as e:  # noqa: BLE001
             log(f"scan error: {e}\n{traceback.format_exc()}")
         sleep_until(next_tick)
@@ -836,6 +858,9 @@ def run_trading_day(today: date):
                         if sig:
                             signals.append(sig)
                 if signals:
+                    signals = [x for x in signals if x["direction"] == "long" or SHORTS_TRADABLE]
+                    if not signals:
+                        raise _NoTradableSignal
                     signals.sort(key=lambda s: -s["score"])
                     best = signals[0]
                     log(f"{len(signals)} bounce signal(s); best {best['symbol']} {best['score']}")
@@ -847,6 +872,8 @@ def run_trading_day(today: date):
                         g0 = bars[bars["symbol"] == best["symbol"]].sort_values("timestamp")
                     announce_entry(best, slots, catalyst_line(best["symbol"], reported,
                                    prev_close.get(best["symbol"]), float(g0["open"].iloc[0]) if not g0.empty else None))
+            except _NoTradableSignal:
+                pass
             except Exception as e:  # noqa: BLE001
                 log(f"bounce scan error: {e}\n{traceback.format_exc()}")
             sleep_until(next_tick)

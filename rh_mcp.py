@@ -192,8 +192,9 @@ async def _with_session(fn):
 
 def _unwrap(result):
     """Tool results come back as content blocks; return parsed JSON when possible."""
-    if getattr(result, "structuredContent", None):
-        return result.structuredContent
+    structured = getattr(result, "structured_content", None) or getattr(result, "structuredContent", None)
+    if structured:
+        return structured
     texts = [c.text for c in result.content if getattr(c, "type", "") == "text"]
     joined = "\n".join(texts)
     try:
@@ -221,7 +222,9 @@ class RH:
     def call(self, tool: str, **args):
         async def go(session):
             res = await session.call_tool(tool, args)
-            if getattr(res, "isError", False):
+            # SDK 2.x renamed isError -> is_error; checking only the old name made every
+            # server-side rejection look like success. Read both.
+            if getattr(res, "is_error", None) or getattr(res, "isError", None):
                 raise RuntimeError(f"{tool}: {_unwrap(res)}")
             return _unwrap(res)
         return self._run(go)
@@ -236,7 +239,8 @@ class RH:
         async def go(session):
             out = {}
             for t in (await session.list_tools()).tools:
-                props = (getattr(t, "inputSchema", None) or {}).get("properties", {}) or {}
+                schema = getattr(t, "input_schema", None) or getattr(t, "inputSchema", None) or {}
+                props = schema.get("properties", {}) or {}
                 out[t.name] = set(props)
             return out
         return self._run(go)

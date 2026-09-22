@@ -511,8 +511,11 @@ def monitor_position(position, today):
                     push(f"{position['symbol']} trailing armed",
                          f"Up {position['peak']*100:.1f}%. Exit if it gives back 2 pts from peak.", 0)
                 if not position["armed"] and ((worst <= position["stop_price"]) if is_long else (worst >= position["stop_price"])):
-                    if live:
+                    if live and position.get("stop_order_id"):
                         continue  # the resting stop order handles it; confirmed via order state above
+                    if live:
+                        _live_exit(position, "STOP LEVEL HIT (no broker stop)")
+                        return
                     push(f"STOP HIT — exit {position['symbol']}",
                          f"Stop {position['stop_price']:.2f} touched. Close the position now.", 2)
                     clear_position()
@@ -571,6 +574,18 @@ def rh_days_left():
 
 def rh_data(res):
     return res.get("data", res) if isinstance(res, dict) else res
+
+
+class Flattened(Exception):
+    """Entry filled but the protective stop could not be placed; the position was sold at market."""
+
+
+class Unprotected(Exception):
+    """Entry filled, the stop failed, AND the flatten failed. Position is open with no stop."""
+
+    def __init__(self, msg, qty=0, avg=None):
+        super().__init__(msg)
+        self.qty, self.avg = qty, avg
 
 
 def rh_account():
@@ -642,10 +657,44 @@ def rh_enter_long(symbol, shares, ref_price, stop_dist):
             pass
     qty = int(filled_qty)  # whole shares only, stop orders can't be fractional
     stop_price = (avg or ref_price) * (1 - stop_dist)   # stop distance re-anchored on the real fill
-    stop = rh_data(rh().call("place_equity_order", account_number=acct, side="sell", symbol=symbol,
-                             type="stop_market", quantity=str(qty), stop_price=f"{stop_price:.2f}",
-                             time_in_force="gfd", ref_id=str(uuid.uuid4())))
-    stop_id = stop.get("id") or (stop.get("order") or {}).get("id")
+
+    # A filled position must never be left without a stop. Place it, confirm the broker
+    # accepted it, and if anything fails, sell immediately at market.
+    stop_id, stop_err = None, None
+    stop_ref = str(uuid.uuid4())
+    for attempt in (1, 2):   # same ref_id on retry: the broker dedupes, so no double stop
+        try:
+            stop = rh_data(rh().call("place_equity_order", account_number=acct, side="sell", symbol=symbol,
+                                     type="stop_market", quantity=str(qty), stop_price=f"{stop_price:.2f}",
+                                     time_in_force="gfd", ref_id=stop_ref))
+            stop_id = stop.get("id") or (stop.get("order") or {}).get("id")
+            if not stop_id:
+                raise RuntimeError(f"no order id in stop response: {json.dumps(stop)[:200]}")
+            time.sleep(2)
+            st = (rh_order(stop_id) or {}).get("state")
+            if st in ("rejected", "failed", "cancelled", "voided"):
+                stop_ref = str(uuid.uuid4())   # broker said no: a retry needs a NEW order, not the same one
+                raise RuntimeError(f"stop order {st}")
+            stop_err = None
+            break
+        except Exception as e:  # noqa: BLE001
+            stop_err, stop_id = e, None
+            log(f"stop placement attempt {attempt} failed: {e}")
+            time.sleep(3)
+    if stop_err is not None:
+        log(f"STOP FAILED for {symbol} x{qty}; flattening at market")
+        try:
+            out = rh_data(rh().call("place_equity_order", account_number=acct, side="sell", symbol=symbol,
+                                    type="market", quantity=str(qty), time_in_force="gfd",
+                                    ref_id=str(uuid.uuid4())))
+            raise Flattened(f"stop failed ({str(stop_err)[:120]}); sold {qty} at market "
+                            f"(order {str(out.get('id'))[:8]})")
+        except Flattened:
+            raise
+        except Exception as e2:  # noqa: BLE001
+            raise Unprotected(f"stop failed ({str(stop_err)[:100]}) AND market sell failed ({str(e2)[:100]}); "
+                              f"{qty} sh {symbol} @ ~{avg or ref_price:.2f} OPEN WITHOUT STOP",
+                              qty=qty, avg=avg or ref_price) from None
     log(f"stop placed {symbol} x{qty} @{stop_price:.2f} id={stop_id}")
     return {"entry_order_id": order_id, "stop_order_id": stop_id, "filled_qty": qty,
             "avg_price": avg or ref_price, "stop_price": round(stop_price, 2)}
@@ -677,6 +726,18 @@ def execute_or_alert(best, slots, cat_text, today):
                             value=fill["avg_price"] * fill["filled_qty"], **fill)
             cat_text = (cat_text + "\n" if cat_text else "") + \
                 f"EXECUTED: {fill['filled_qty']} sh filled @ {fill['avg_price']:.2f}, stop resting @ {position['stop_price']:.2f}"
+        except Flattened as e:
+            log(f"entered then flattened: {e}")
+            cat_text = (cat_text + "\n" if cat_text else "") + \
+                f"ENTERED THEN SOLD — the protective stop could not be placed, so the position was closed at market. {str(e)[:140]}"
+        except Unprotected as e:
+            log(f"UNPROTECTED POSITION: {e}")
+            push(f"UNPROTECTED — close {best['symbol']} manually NOW", str(e)[:400], 2)
+            # manage it as live with no resting stop: the monitor sells on stop/trail/EOD
+            position.update(live=True, stop_order_id=None, shares=e.qty or best["shares"],
+                            entry_price=e.avg or best["entry_price"],
+                            stop_price=(e.avg or best["entry_price"]) * (1 - best["stop_dist"]))
+            cat_text = (cat_text + "\n" if cat_text else "") + "FILLED, NO STOP AT BROKER — see emergency alert."
         except rh_login_expired() as e:
             log(f"execution blocked, login expired: {e}")
             cat_text = (cat_text + "\n" if cat_text else "") + "NOT EXECUTED — Robinhood login expired. Trade manually if you want it."
@@ -721,6 +782,12 @@ def run_trading_day(today: date):
                 bp = rh_buying_power()
                 if bp > 0:
                     ACCOUNT_EQUITY = bp
+                problems = rh().schema_problems()
+                if problems:
+                    log(f"Robinhood tool schema changed: {problems}")
+                    push("Robinhood tools changed — execution OFF today",
+                         "\n".join(problems[:5]) + "\nAlerts continue; send this to be patched.", 1)
+                    break
                 _execution_ok = True
                 log(f"EXECUTE on: agentic account ••••{rh_account()[-4:]}, buying power ${bp:,.2f}"
                     + (f", login {days:.1f}d left" if days is not None else ""))

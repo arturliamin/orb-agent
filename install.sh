@@ -26,9 +26,12 @@ systemctl daemon-reload && systemctl enable --now orb-agent && systemctl restart
 echo ">>> Agent running. Logs: journalctl -u orb-agent -f"
 fi
 
-# --- keep the Robinhood login alive: refresh twice a week, well inside the ~7.8 day token life
+# --- pre-open Robinhood check: weekdays 11:00 UTC (7:00 AM ET in summer, 6:00 AM after Nov 1).
+# Silent when healthy; pushes if the login needs re-authorization. The orb user must be able
+# to read the env file for the Pushover credentials.
+chgrp orb /etc/orb-agent.env && chmod 640 /etc/orb-agent.env
 cat > /etc/cron.d/orb-agent-refresh <<'CRON'
-17 7 * * 1,4 orb STATE_DIR=/var/lib/orb-agent /opt/orb-agent/venv/bin/python /opt/orb-agent/rh_mcp.py refresh >> /var/log/orb-refresh.log 2>&1
+0 11 * * 1-5 orb set -a; . /etc/orb-agent.env; set +a; STATE_DIR=/var/lib/orb-agent /opt/orb-agent/venv/bin/python /opt/orb-agent/rh_mcp.py check >> /var/lib/orb-agent/refresh.log 2>&1
 CRON
 chmod 644 /etc/cron.d/orb-agent-refresh
-echo ">>> Weekly token refresh installed (Mon/Thu 07:17)."
+echo ">>> Pre-open Robinhood check installed (weekdays 11:00 UTC)."

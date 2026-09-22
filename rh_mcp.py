@@ -13,6 +13,11 @@ Read-only probe (proves auth + lists accounts, buying power, a quote):
 Force a token refresh without a browser (a weekly cron can keep the login alive):
     sudo -u orb /opt/orb-agent/venv/bin/python /opt/orb-agent/rh_mcp.py refresh
 
+Pre-open health check (cron, weekdays 7:00 AM ET): renews if possible, and PUSHES you
+if the login needs a browser re-authorization or is close to expiry. Needs PUSHOVER_TOKEN
+and PUSHOVER_USER in the environment (the cron line loads /etc/orb-agent.env):
+    rh_mcp.py check
+
 Check how long the current login has left (exit code 1 if it expires within 2 days):
     sudo -u orb /opt/orb-agent/venv/bin/python /opt/orb-agent/rh_mcp.py status
 
@@ -260,6 +265,53 @@ def _cmd_refresh():
         print("NOTE: expiry did not move — the token was still valid, so no refresh was attempted.")
 
 
+def _notify(title: str, message: str, priority: int = 0) -> None:
+    """Pushover via stdlib so the check has no extra dependencies."""
+    import urllib.parse
+    import urllib.request
+    tok, usr = os.environ.get("PUSHOVER_TOKEN"), os.environ.get("PUSHOVER_USER")
+    if not tok or not usr:
+        print(f"(no Pushover credentials in env; would have sent: {title} | {message})")
+        return
+    data = urllib.parse.urlencode({"token": tok, "user": usr, "title": title,
+                                   "message": message, "priority": priority}).encode()
+    try:
+        urllib.request.urlopen("https://api.pushover.net/1/messages.json", data=data, timeout=15)
+    except Exception as e:  # noqa: BLE001
+        print(f"push failed: {e}")
+
+
+def _cmd_check():
+    """Daily pre-open check. Silent when healthy; pushes when you need to act."""
+    stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    relogin = "Re-authorize from your phone:\nsudo -u orb /opt/orb-agent/venv/bin/python /opt/orb-agent/rh_mcp.py login\nthen: systemctl restart orb-agent"
+    last = None
+    for attempt in (1, 2):
+        try:
+            n = len(RH().tools())
+            days = FileTokenStorage().expiry_info()[1]
+            print(f"{stamp} check OK ({n} tools), login {days:.1f}d left" if days is not None
+                  else f"{stamp} check OK ({n} tools)")
+            if days is not None and days < WARN_WITHIN_DAYS:
+                _notify("Robinhood login expiring",
+                        f"About {days:.1f} day(s) left.\n{relogin}", 1)
+            return
+        except LoginExpired as e:
+            print(f"{stamp} LOGIN EXPIRED: {e}")
+            _notify("Robinhood login expired — act before the open",
+                    f"Execution will be OFF today unless you re-authorize.\n{relogin}", 1)
+            raise SystemExit(1)
+        except Exception as e:  # noqa: BLE001
+            last = e
+            print(f"{stamp} check attempt {attempt} failed: {e}")
+            if attempt == 1:
+                time.sleep(30)
+    _notify("Robinhood check failed",
+            f"Couldn't reach Robinhood at 7:00 (not a login problem).\n{str(last)[:200]}\n"
+            f"The 9:15 check will retry.", 0)
+    raise SystemExit(1)
+
+
 def _cmd_status():
     left, days = FileTokenStorage().expiry_info()
     if days is None:
@@ -272,4 +324,4 @@ def _cmd_status():
 if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else "probe"
     {"login": _cmd_login, "probe": _cmd_probe,
-     "refresh": _cmd_refresh, "status": _cmd_status}.get(cmd, _cmd_probe)()
+     "refresh": _cmd_refresh, "status": _cmd_status, "check": _cmd_check}.get(cmd, _cmd_probe)()

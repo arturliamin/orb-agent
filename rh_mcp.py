@@ -53,6 +53,20 @@ REDIRECT_URI = "http://localhost:8765/callback"
 INTERACTIVE = False          # set True only by the `login` CLI command
 WARN_WITHIN_DAYS = 2
 
+# Every tool the agent calls, with every argument it sends. Verified against the live
+# schemas on 2026-09-22. If Robinhood renames a tool or an argument during the beta,
+# the pre-open check fails loudly instead of the agent failing mid-trade.
+REQUIRED_TOOLS = {
+    "get_accounts": [],
+    "get_portfolio": ["account_number"],
+    "review_equity_order": ["account_number", "side", "symbol", "type", "quantity",
+                            "limit_price", "time_in_force"],
+    "place_equity_order": ["account_number", "side", "symbol", "type", "quantity",
+                           "limit_price", "stop_price", "time_in_force", "ref_id"],
+    "get_equity_orders": ["account_number", "order_id"],
+    "cancel_equity_order": ["account_number", "order_id"],
+}
+
 _sdk_msgs: list[str] = []
 
 
@@ -217,6 +231,29 @@ class RH:
             return [t.name for t in (await session.list_tools()).tools]
         return self._run(go)
 
+    def tool_schemas(self) -> dict:
+        """{tool_name: set(argument names)} from the live server."""
+        async def go(session):
+            out = {}
+            for t in (await session.list_tools()).tools:
+                props = (getattr(t, "inputSchema", None) or {}).get("properties", {}) or {}
+                out[t.name] = set(props)
+            return out
+        return self._run(go)
+
+    def schema_problems(self) -> list[str]:
+        """Empty list when every required tool and argument exists."""
+        live = self.tool_schemas()
+        problems = []
+        for tool, args in REQUIRED_TOOLS.items():
+            if tool not in live:
+                problems.append(f"missing tool {tool}")
+                continue
+            missing = [a for a in args if a not in live[tool]]
+            if missing:
+                problems.append(f"{tool} lost args {missing}")
+        return problems
+
     @staticmethod
     def days_left() -> float | None:
         return FileTokenStorage().expiry_info()[1]
@@ -288,10 +325,18 @@ def _cmd_check():
     last = None
     for attempt in (1, 2):
         try:
-            n = len(RH().tools())
+            rh = RH()
+            problems = rh.schema_problems()
+            if problems:
+                print(f"{stamp} TOOL SCHEMA CHANGED: {problems}")
+                _notify("Robinhood tools changed — execution disabled today",
+                        "The agent's order tools no longer match Robinhood's:\n"
+                        + "\n".join(problems[:5]) + "\nAlerts continue; send this to be patched.", 1)
+                raise SystemExit(2)
+            n = len(REQUIRED_TOOLS)
             days = FileTokenStorage().expiry_info()[1]
-            print(f"{stamp} check OK ({n} tools), login {days:.1f}d left" if days is not None
-                  else f"{stamp} check OK ({n} tools)")
+            print(f"{stamp} check OK ({n}/{n} required tools verified), login {days:.1f}d left"
+                  if days is not None else f"{stamp} check OK ({n}/{n} required tools verified)")
             if days is not None and days < WARN_WITHIN_DAYS:
                 _notify("Robinhood login expiring",
                         f"About {days:.1f} day(s) left.\n{relogin}", 1)

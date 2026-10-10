@@ -102,6 +102,7 @@ os.makedirs(STATE_DIR, exist_ok=True)
 TRADES_FILE = os.path.join(STATE_DIR, "trades.json")
 POSITION_FILE = os.path.join(STATE_DIR, "position.json")
 LOG_CSV = os.path.join(STATE_DIR, "trending_log.csv")
+OUTCOME_CSV = os.path.join(STATE_DIR, "outcomes.csv")
 
 data = StockHistoricalDataClient(API_KEY, SECRET_KEY)
 screener = ScreenerClient(API_KEY, SECRET_KEY)
@@ -325,9 +326,18 @@ def evaluate_symbol(sym, day_bars, rng, baseline, spy_bars, rank, catalyst=False
         if direction == "short":
             rel = -rel
     score = score_signal(vol_mult, stop_dist, rel, rank, catalyst)
+    rh_, rl_ = float(rng["high"]), float(rng["low"])
+    lvl_ = rh_ if direction == "long" else rl_
+    sgn = 1.0 if direction == "long" else -1.0
+    day_open = float(df["open"].iloc[0])
     return dict(symbol=sym, direction=direction, setup="ORB", entry_price=entry, stop_price=stop_price,
                 stop_dist=stop_dist, shares=shares, value=value, vol_mult=vol_mult,
-                rel=rel, rank=rank, score=score, catalyst=catalyst, time=row["timestamp"].isoformat())
+                rel=rel, rank=rank, score=score, catalyst=catalyst, time=row["timestamp"].isoformat(),
+                ext_level=sgn * (entry - lvl_) / lvl_,
+                ext_level_mult=(sgn * (entry - lvl_) / (rh_ - rl_)) if rh_ > rl_ else float("nan"),
+                ext_vwap=sgn * (entry - float(row["vwap"])) / float(row["vwap"]),
+                ext_open=sgn * (entry - day_open) / day_open,
+                range_pct=(rh_ - rl_) / rl_ if rl_ else float("nan"))
 
 
 # ------------------------------------------------------------------ earnings catalyst
@@ -452,9 +462,13 @@ def evaluate_bounce(sym, day_bars, lvl, baseline, spy_bars, rank, catalyst=False
             spy_move = (sp_since["close"].iloc[-1] - sp_since["open"].iloc[0]) / sp_since["open"].iloc[0]
             rel = (entry - touch_low) / touch_low - spy_move
     score = score_signal(vol_mult, stop_dist, rel, rank, catalyst)
+    day_open = float(df["open"].iloc[0])
     return dict(symbol=sym, direction="long", setup="MA50_BOUNCE", entry_price=entry, stop_price=stop_price,
                 stop_dist=stop_dist, shares=shares, value=value, vol_mult=vol_mult, rel=rel, rank=rank,
-                score=score, catalyst=catalyst, time=row["timestamp"].isoformat(), sma50=lvl["sma50"])
+                score=score, catalyst=catalyst, time=row["timestamp"].isoformat(), sma50=lvl["sma50"],
+                ext_level=(entry - float(lvl["sma50"])) / float(lvl["sma50"]),
+                ext_level_mult=float("nan"), ext_vwap=float("nan"),
+                ext_open=(entry - day_open) / day_open, range_pct=float("nan"))
 
 
 def announce_entry(best, slots, cat_text=""):
@@ -469,6 +483,37 @@ def announce_entry(best, slots, cat_text=""):
          f"\nTrail arms at +5%, 2pt giveback. Slots left after this: {slots-1}", 2)
 
 
+OUTCOME_FIELDS = ["date", "symbol", "setup", "direction", "live", "entry_price", "stop_price",
+                  "stop_dist", "shares", "score", "vol_mult", "rel", "rank", "range_pct",
+                  "ext_level", "ext_level_mult", "ext_vwap", "ext_open",
+                  "mfe_pct", "mae_pct", "armed", "exit_reason", "exit_price", "pnl_dollars"]
+
+
+def log_outcome(position, reason, exit_price=None):
+    try:
+        ep = float(position.get("entry_price") or 0)
+        xp = float(exit_price) if exit_price else float(position.get("stop_price") or 0)
+        sh = float(position.get("shares") or 0)
+        row = {k: position.get(k, "") for k in OUTCOME_FIELDS}
+        row.update(date=position.get("date", ""), exit_reason=reason,
+                   exit_price=round(xp, 4) if xp else "",
+                   mfe_pct=round(float(position.get("peak", 0.0)) * 100, 3),
+                   mae_pct=round(float(position.get("mae", 0.0)) * 100, 3),
+                   pnl_dollars=round((xp - ep) * sh, 2) if (xp and ep) else "")
+        for k in ("ext_level", "ext_level_mult", "ext_vwap", "ext_open", "range_pct",
+                  "stop_dist", "rel", "vol_mult"):
+            v = position.get(k)
+            row[k] = round(float(v), 5) if isinstance(v, (int, float)) else ""
+        new = not os.path.exists(OUTCOME_CSV)
+        with open(OUTCOME_CSV, "a", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=OUTCOME_FIELDS, extrasaction="ignore")
+            if new:
+                w.writeheader()
+            w.writerow(row)
+    except Exception as e:  # noqa: BLE001
+        log(f"outcome log failed: {e}")
+
+
 def _live_exit(position, reason):
     """Market-out a live position and report; returns True when done."""
     try:
@@ -479,6 +524,7 @@ def _live_exit(position, reason):
             push(f"{reason} — SOLD {position['symbol']}", f"Market sell placed for {position['shares']} sh (order {str(oid)[:8]}).", 1)
     except Exception as e:  # noqa: BLE001
         push(f"{reason} — SELL FAILED {position['symbol']}", f"Close it manually NOW.\n{str(e)[:200]}", 2)
+    log_outcome(position, reason)
     clear_position()
     return True
 
@@ -496,6 +542,7 @@ def monitor_position(position, today):
                 if so.get("state") == "filled":
                     push(f"STOP FILLED — {position['symbol']}",
                          f"Sold {so.get('cumulative_quantity')} @ {so.get('average_price')}. Position closed.", 1)
+                    log_outcome(position, "STOP FILLED", so.get("average_price"))
                     clear_position()
                     return
             b = fetch_bars([position["symbol"]], datetime.fromisoformat(position["time"]), now())
@@ -506,6 +553,7 @@ def monitor_position(position, today):
                 best_gain = (best - ep) / ep if is_long else (ep - best) / ep
                 worst_gain = (worst - ep) / ep if is_long else (ep - worst) / ep
                 position["peak"] = max(position["peak"], best_gain)
+                position["mae"] = min(position.get("mae", 0.0), worst_gain)
                 if position["peak"] >= TRAIL_ARM_PCT and not position["armed"]:
                     position["armed"] = True
                     push(f"{position['symbol']} trailing armed",
@@ -518,6 +566,7 @@ def monitor_position(position, today):
                         return
                     push(f"STOP HIT — exit {position['symbol']}",
                          f"Stop {position['stop_price']:.2f} touched. Close the position now.", 2)
+                    log_outcome(position, "STOP HIT (alert)")
                     clear_position()
                     return
                 if position["armed"]:
@@ -529,6 +578,7 @@ def monitor_position(position, today):
                             return
                         push(f"TRAIL HIT — exit {position['symbol']}",
                              f"Gave back 2 pts from +{position['peak']*100:.1f}% peak (~{lvl:.2f}). Close now.", 2)
+                        log_outcome(position, "TRAIL HIT (alert)", lvl)
                         clear_position()
                         return
             save_position(position)
@@ -539,6 +589,7 @@ def monitor_position(position, today):
         _live_exit(position, "EOD CLOSE")
         return
     push(f"EOD — close {position['symbol']}", "10 minutes to close and no exit has triggered. Close the position.", 2)
+    log_outcome(position, "EOD (alert)")
     clear_position()
 
 
@@ -718,7 +769,7 @@ def rh_exit_market(symbol, qty, stop_order_id):
 
 def execute_or_alert(best, slots, cat_text, today):
     """Announce the signal; if EXECUTE and long, place the trade and return an enriched position."""
-    position = dict(best, date=today.isoformat(), peak=0.0, armed=False, live=False)
+    position = dict(best, date=today.isoformat(), peak=0.0, mae=0.0, armed=False, live=False)
     if EXECUTE and _execution_ok and best["direction"] == "long" and ACCOUNT_EQUITY > 0:
         try:
             fill = rh_enter_long(best["symbol"], best["shares"], best["entry_price"], best["stop_dist"])

@@ -161,9 +161,10 @@ async def _callback_handler() -> AuthorizationCodeResult:
     q = parse_qs(urlparse(cleaned).query)
     code = ((q.get("code") or [None])[0] or "").strip("'\" ")
     state = ((q.get("state") or [None])[0] or "").strip("'\" ") or None
+    iss = ((q.get("iss") or [None])[0] or "").strip("'\" ") or None
     if not code:
         raise SystemExit("No ?code= found in what you pasted. Try the login again.")
-    return AuthorizationCodeResult(code=code, state=state)
+    return AuthorizationCodeResult(code=code, state=state, iss=iss)
 
 
 def _provider() -> OAuthClientProvider:
